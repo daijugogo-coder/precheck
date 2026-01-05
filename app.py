@@ -743,16 +743,22 @@ def compare_with_current_inventory(giniepos_df: pd.DataFrame, current_df: pd.Dat
 # ファイルアップロードセクション
 st.header("1️⃣ ファイルアップロード")
 
-# 実行モードの選択
-mode = st.selectbox("実行モードを選択してください", ["Full (8 files)", "Sales only (single sales file)"])
-
+# シンプル表示: Full (8 files) のみ
 col1, col2 = st.columns([4, 1])
-
 with col1:
-    if mode == "Full (8 files)":
-        st.info("📁 必要な8つのファイルをまとめてドラッグ&ドロップしてください")
-    else:
-        st.info("📁 売上ファイルのみでチェックします。売上ファイルと現在庫（Excel）、必要なマスタをアップロードしてください")
+    st.markdown("**📁 必要な8つのファイルをまとめてドラッグ＆ドロップしてください**")
+    # 視覚的ドロップエリア（表示用）
+    st.markdown(
+        """
+<div style='border:2px dashed #bbb; border-radius:8px; padding:18px; min-height:220px; display:flex; align-items:center; justify-content:center;'>
+  <div style='text-align:center; color:#666;'>
+    <div style='font-size:16px; font-weight:600;'>Drag and drop files here</div>
+    <div style='font-size:12px; margin-top:6px;'>在庫変動データ4つ + 現在庫照会 + マスタ3つ = 合計8ファイル</div>
+  </div>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 with col2:
     if st.button("🔄 クリア", key='clear_btn', help="アップロードしたファイルをクリア"):
@@ -760,32 +766,14 @@ with col2:
             del st.session_state[k]
         safe_rerun()
 
-if mode == "Full (8 files)":
-    uploaded_files = st.file_uploader(
-        "ファイルを選択またはドラッグ&ドロップ",
-        type=['csv', 'xlsx', 'xls'],
-        accept_multiple_files=True,
-        help="在庫変動データ4ファイル + 現在庫照会 + マスタ3ファイル = 計8ファイル"
-    )
-else:
-    # Sales-only mode: 単一の売上ファイル、現在庫、マスタ（任意）を受け取る
-    sales_file = st.file_uploader(
-        "売上ファイルを選択（CSV）",
-        type=['csv'],
-        accept_multiple_files=False,
-        key='sales_only'
-    )
-    current_file = st.file_uploader(
-        "現在庫照会ファイルを選択（Excel）",
-        type=['xlsx', 'xls'],
-        accept_multiple_files=False,
-        key='current_only'
-    )
-    st.markdown("---")
-    st.markdown("**必要に応じてマスタファイル（857001, 857002, 857003）をアップロード**")
-    master_857001_file = st.file_uploader("マスタ857001 (取次店)", type=['csv'], key='m857001')
-    master_857002_file = st.file_uploader("マスタ857002 (商品)", type=['csv'], key='m857002')
-    master_857003_file = st.file_uploader("マスタ857003 (仕入先)", type=['csv'], key='m857003')
+# 実際のアップローダ（見た目とは別に機能する）
+uploaded_files = st.file_uploader(
+    "ファイルを選択またはドラッグ&ドロップ",
+    type=['csv', 'xlsx', 'xls'],
+    accept_multiple_files=True,
+    help="在庫変動データ4ファイル + 現在庫照会 + マスタ3ファイル = 計8ファイル",
+    key='uploader'
+)
 
 # ファイル名からファイルを振り分け
 shiire_file = None
@@ -849,131 +837,180 @@ if uploaded_files:
 
 st.markdown("---")
 
-# 処理実行ボタン
-if st.button("🚀 在庫チェック実行", type="primary", use_container_width=True):
+# 自動実行: 全8ファイルが揃ったら自動で処理を走らせる
+def run_full_check(shiire_file, ido_file, uri_file, tana_file, current_file, master_857001_file, master_857002_file, master_857003_file):
     if not all([shiire_file, ido_file, uri_file, tana_file, current_file]):
         st.error("⚠️ 在庫変動データと現在庫照会ファイルは必須です")
-    else:
-        with st.spinner("処理中..."):
+        return
+
+    with st.spinner("処理中..."):
+        try:
+            # マスタファイルの読み込み
+            st.info("📚 マスタファイル読み込み中...")
+            masters = load_master_files(master_857001_file, master_857002_file, master_857003_file)
+
+            # CSVファイルの読み込み（LF改行、Shift-JIS）
+            st.info("📂 在庫変動データ読み込み中...")
+            shiire_df = load_csv_with_encoding(shiire_file, use_lf=True, encoding='cp932')
+            ido_df = load_csv_with_encoding(ido_file, use_lf=True, encoding='cp932')
+            uri_df = load_csv_with_encoding(uri_file, use_lf=True, encoding='cp932')
+            if uri_df is None:
+                uri_df = pd.DataFrame()
+            tana_df = load_csv_with_encoding(tana_file, use_lf=True, encoding='cp932')
+
+            # 現在庫ファイルの読み込み
+            st.info("📊 現在庫照会読み込み中...")
+            current_df = pd.read_excel(current_file)
+            st.success(f"✅ 現在庫照会: {len(current_df)}行")
+
+            # 仕入データ処理
+            st.info("🔄 仕入データ処理中...")
+            shiire_processed = process_shiire_data(shiire_df, masters)
+            shiire_individual = process_shiire_individual(shiire_processed)
+            shiire_accessory = process_shiire_accessory(shiire_processed)
+            st.success(f"✅ 仕入（個体）: {len(shiire_individual)}行、仕入（アクセサリ）: {len(shiire_accessory)}行")
+
+            # 移動データ処理
+            st.info("🔄 移動データ処理中...")
+            ido_processed = process_ido_data(ido_df, masters)
+            ido_shukko = process_ido_shukko(ido_processed)
+            ido_nyuko = process_ido_nyuko(ido_processed)
+            st.success(f"✅ 移動（出庫）: {len(ido_shukko)}行、移動（入庫）: {len(ido_nyuko)}行")
+
+            # 売上データ処理
+            st.info("🔄 売上データ処理中...")
+            # 1) main.py 相当の CSV レベルのチェックを先に実行（生データを検査）
             try:
-                # マスタファイルの読み込み
-                st.info("📚 マスタファイル読み込み中...")
-                masters = load_master_files(master_857001_file, master_857002_file, master_857003_file)
-                
-                # CSVファイルの読み込み（LF改行、Shift-JIS）
-                st.info("📂 在庫変動データ読み込み中...")
-                shiire_df = load_csv_with_encoding(shiire_file, use_lf=True, encoding='cp932')
-                ido_df = load_csv_with_encoding(ido_file, use_lf=True, encoding='cp932')
-                uri_df = load_csv_with_encoding(uri_file, use_lf=True, encoding='cp932')
-                if uri_df is None:
-                    uri_df = pd.DataFrame()
-                tana_df = load_csv_with_encoding(tana_file, use_lf=True, encoding='cp932')
-                
-                # 現在庫ファイルの読み込み
-                st.info("📊 現在庫照会読み込み中...")
-                current_df = pd.read_excel(current_file)
-                st.success(f"✅ 現在庫照会: {len(current_df)}行")
-                
-                # 仕入データ処理
-                st.info("🔄 仕入データ処理中...")
-                shiire_processed = process_shiire_data(shiire_df, masters)
-                shiire_individual = process_shiire_individual(shiire_processed)
-                shiire_accessory = process_shiire_accessory(shiire_processed)
-                st.success(f"✅ 仕入（個体）: {len(shiire_individual)}行、仕入（アクセサリ）: {len(shiire_accessory)}行")
-                
-                # 移動データ処理
-                st.info("🔄 移動データ処理中...")
-                ido_processed = process_ido_data(ido_df, masters)
-                ido_shukko = process_ido_shukko(ido_processed)
-                ido_nyuko = process_ido_nyuko(ido_processed)
-                st.success(f"✅ 移動（出庫）: {len(ido_shukko)}行、移動（入庫）: {len(ido_nyuko)}行")
-                
-                # 売上データ処理
-                st.info("🔄 売上データ処理中...")
+                raw_bytes = uri_file.getvalue()
+                text = raw_bytes.decode('cp932')
+            except Exception:
+                text = None
 
-                # 1) main.py 相当の CSV レベルのチェックを先に実行（生データを検査）
+            if text:
                 try:
-                    raw_bytes = uri_file.getvalue()
-                    text = raw_bytes.decode('cp932')
-                except Exception:
-                    text = None
-
-                if text:
-                    try:
-                        err_flag, err_details, total_records, total_physical_lines, date_summary = check_and_analyze(text)
-                        if err_flag:
-                            st.error("❌ 売上ファイルに NG 条件が見つかりました。処理を中止します。")
-                            st.write(f"NG件数: {len(err_details)} 件")
-                            err_csv = build_error_csv_bytes(err_details)
-                            st.download_button("NG行一覧をダウンロード (UTF-8)", data=err_csv, file_name=f"{uri_file.name}_ng.csv")
-                            # 日付指摘もダウンロード可能
+                    err_flag, err_details, total_records, total_physical_lines, date_summary = check_and_analyze(text)
+                    if err_flag:
+                        st.error("❌ 売上ファイルに NG 条件が見つかりました。処理を中止します。")
+                        st.write(f"NG件数: {len(err_details)} 件")
+                        err_csv = build_error_csv_bytes(err_details)
+                        st.download_button("NG行一覧をダウンロード (UTF-8)", data=err_csv, file_name=f"{uri_file.name}_ng.csv")
+                        # 日付指摘もダウンロード可能
+                        ds_bytes = build_date_issue_csv_bytes(date_summary.issues)
+                        st.download_button("日付チェック指摘をダウンロード (UTF-8)", data=ds_bytes, file_name=f"{uri_file.name}_date_issues.csv")
+                        return
+                    else:
+                        # 日付チェックの警告などを表示（あれば）
+                        if date_summary.issues:
+                            st.warning(f"日付チェックで指摘があります（{len(date_summary.issues)} 件）。ダウンロードして確認してください。")
                             ds_bytes = build_date_issue_csv_bytes(date_summary.issues)
                             st.download_button("日付チェック指摘をダウンロード (UTF-8)", data=ds_bytes, file_name=f"{uri_file.name}_date_issues.csv")
-                            st.stop()
-                        else:
-                            # 日付チェックの警告などを表示（あれば）
-                            if date_summary.issues:
-                                st.warning(f"日付チェックで指摘があります（{len(date_summary.issues)} 件）。ダウンロードして確認してください。")
-                                ds_bytes = build_date_issue_csv_bytes(date_summary.issues)
-                                st.download_button("日付チェック指摘をダウンロード (UTF-8)", data=ds_bytes, file_name=f"{uri_file.name}_date_issues.csv")
-                    except Exception as e:
-                        st.warning(f"売上ファイルの事前チェックで例外: {e}")
-
-                # 2) 既存の前処理: AG列削除とドコモショップ抽出
-                try:
-                    before_rows = len(uri_df)
-                    uri_df = drop_ag_column(uri_df)
-                    kept_df, omitted_df = split_docomo_shop_rows(uri_df)
-                    kept_rows = len(kept_df)
-                    omitted_rows = len(omitted_df)
-                    st.info(f"🔎 売上前処理: {before_rows}行 -> ドコモショップ抽出 {kept_rows}行 (除外 {omitted_rows}行)")
-                    uri_df = kept_df
                 except Exception as e:
-                    st.warning(f"売上前処理で注意: {e}")
+                    st.warning(f"売上ファイルの事前チェックで例外: {e}")
 
-                uri_processed = process_uri_data(uri_df, masters)
-                uri_individual = process_uri_individual(uri_processed)
-                uri_sb_accessory = process_uri_sb_accessory(uri_processed)
-                uri_service = process_uri_service(uri_processed)
-                st.success(f"✅ 売上（個体）: {len(uri_individual)}行、売上（SBアクセサリ）: {len(uri_sb_accessory)}行、売上（サービス）: {len(uri_service)}行")
-                
-                # 棚卸データ処理
-                st.info("🔄 棚卸データ処理中...")
-                tana_processed = process_tana_data(tana_df, masters)
-                tana_grouped = process_tana_grouped(tana_processed)
-                st.success(f"✅ 棚卸: {len(tana_grouped)}行")
-                
-                # 全データ結合
-                st.info("🔗 データ結合・集計中...")
-                giniepos_hendo = combine_all_data(
-                    shiire_individual, shiire_accessory,
-                    ido_shukko, ido_nyuko,
-                    uri_individual, uri_sb_accessory, uri_service,
-                    tana_grouped
-                )
-                st.success(f"✅ GINIEPOS変動数: {len(giniepos_hendo)}行")
-                
-                # 現在庫との比較
-                st.info("🔍 在庫過不足チェック中...")
-                result_df = compare_with_current_inventory(giniepos_hendo, current_df)
-                
-                # 結果をセッションステートに保存
-                st.session_state.processed_data = result_df
-                
-                st.success("✅ 処理完了！")
-                
+            # 2) 既存の前処理: AG列削除とドコモショップ抽出
+            try:
+                before_rows = len(uri_df)
+                uri_df = drop_ag_column(uri_df)
+                kept_df, omitted_df = split_docomo_shop_rows(uri_df)
+                kept_rows = len(kept_df)
+                omitted_rows = len(omitted_df)
+                st.info(f"🔎 売上前処理: {before_rows}行 -> ドコモショップ抽出 {kept_rows}行 (除外 {omitted_rows}行)")
+                uri_df = kept_df
             except Exception as e:
-                st.error(f"❌ エラーが発生しました: {str(e)}")
-                st.exception(e)
+                st.warning(f"売上前処理で注意: {e}")
+
+            uri_processed = process_uri_data(uri_df, masters)
+            uri_individual = process_uri_individual(uri_processed)
+            uri_sb_accessory = process_uri_sb_accessory(uri_processed)
+            uri_service = process_uri_service(uri_processed)
+            st.success(f"✅ 売上（個体）: {len(uri_individual)}行、売上（SBアクセサリ）: {len(uri_sb_accessory)}行、売上（サービス）: {len(uri_service)}行")
+
+            # 棚卸データ処理
+            st.info("🔄 棚卸データ処理中...")
+            tana_processed = process_tana_data(tana_df, masters)
+            tana_grouped = process_tana_grouped(tana_processed)
+            st.success(f"✅ 棚卸: {len(tana_grouped)}行")
+
+            # 全データ結合
+            st.info("🔗 データ結合・集計中...")
+            giniepos_hendo = combine_all_data(
+                shiire_individual, shiire_accessory,
+                ido_shukko, ido_nyuko,
+                uri_individual, uri_sb_accessory, uri_service,
+                tana_grouped
+            )
+            st.success(f"✅ GINIEPOS変動数: {len(giniepos_hendo)}行")
+
+            # 現在庫との比較
+            st.info("🔍 在庫過不足チェック中...")
+            result_df = compare_with_current_inventory(giniepos_hendo, current_df)
+
+            # 結果をセッションステートに保存
+            st.session_state.processed_data = result_df
+
+            st.success("✅ 処理完了！")
+
+        except Exception as e:
+            st.error(f"❌ エラーが発生しました: {str(e)}")
+            st.exception(e)
+
+
+if 'last_full_sig' not in st.session_state:
+    st.session_state['last_full_sig'] = None
+
+if uploaded_files:
+    # decide files again and auto-run
+    for file in uploaded_files:
+        filename = file.name
+        if 'SHI' in filename.upper():
+            shiire_file = file
+        elif 'IDO' in filename.upper():
+            ido_file = file
+        elif 'URI' in filename.upper():
+            uri_file = file
+        elif 'TNA' in filename.upper():
+            tana_file = file
+        elif '現在庫' in filename or 'ZAIKO' in filename.upper():
+            current_file = file
+        elif '857001' in filename:
+            master_857001_file = file
+        elif '857002' in filename:
+            master_857002_file = file
+        elif '857003' in filename:
+            master_857003_file = file
+
+    total_files = sum([
+        shiire_file is not None,
+        ido_file is not None,
+        uri_file is not None,
+        tana_file is not None,
+        current_file is not None,
+        master_857001_file is not None,
+        master_857002_file is not None,
+        master_857003_file is not None
+    ])
+
+    if total_files < 8:
+        st.warning(f"⚠️ {total_files}/8ファイルが認識されました。全8ファイル必要です。")
+    else:
+        st.success("✅ 全8ファイルが揃いました！ 自動で処理を開始します...")
+        sig_parts = []
+        for f in uploaded_files:
+            try:
+                b = f.getvalue()
+                sig_parts.append((f.name, len(b), hashlib.sha256(b).hexdigest()))
+            except Exception:
+                sig_parts.append((f.name, None, None))
+        sig = tuple(sig_parts)
+        if st.session_state['last_full_sig'] != sig:
+            st.session_state['last_full_sig'] = sig
+            run_full_check(shiire_file, ido_file, uri_file, tana_file, current_file, master_857001_file, master_857002_file, master_857003_file)
 
 # 結果表示セクション
 if st.session_state.processed_data is not None and not st.session_state.processed_data.empty:
     st.markdown("---")
     st.header("2️⃣ 在庫不足結果")
-    
     result_df = st.session_state.processed_data
-    
-    # サマリー情報
     col1, col2, col3 = st.columns(3)
     with col1:
         st.metric("在庫不足件数", f"{len(result_df)}件")
@@ -983,29 +1020,13 @@ if st.session_state.processed_data is not None and not st.session_state.processe
     with col3:
         total_cl = result_df['CL実在庫数'].sum()
         st.metric("CL実在庫合計", f"{int(total_cl):,}")
-    
-    # データテーブル表示
-    st.subheader("📋 詳細リスト")
-    
+
     display_cols = ['取次店コード', '取次店名', 'TMS商品CD', '変動数', 'CL実在庫数', '判定']
     available_cols = [col for col in display_cols if col in result_df.columns]
-    
-    st.dataframe(
-        result_df[available_cols].sort_values('判定'),
-        use_container_width=True,
-        height=400
-    )
-    
-    # CSVダウンロードボタン
+    st.subheader("📋 詳細リスト")
+    st.dataframe(result_df[available_cols].sort_values('判定'), use_container_width=True, height=400)
     csv = result_df[available_cols].to_csv(index=False, encoding='cp932')
-    st.download_button(
-        label="📥 結果をCSVでダウンロード",
-        data=csv,
-        file_name="在庫不足結果.csv",
-        mime="text/csv",
-        use_container_width=True
-    )
-
+    st.download_button(label="📥 結果をCSVでダウンロード", data=csv, file_name="在庫不足結果.csv", mime="text/csv", use_container_width=True)
 elif st.session_state.processed_data is not None:
     st.success("✅ 在庫不足はありません！")
 
