@@ -25,6 +25,28 @@ st.markdown("---")
 if 'processed_data' not in st.session_state:
     st.session_state.processed_data = None
 
+
+def safe_rerun() -> None:
+    """Rerun the Streamlit script in a way compatible with multiple Streamlit versions."""
+    # Preferred API
+    if hasattr(st, "experimental_rerun"):
+        try:
+            st.experimental_rerun()
+            return
+        except Exception:
+            pass
+
+    # Fallback: raise the internal RerunException
+    try:
+        from streamlit.runtime.scriptrunner.script_runner import RerunException
+        raise RerunException()
+    except Exception:
+        # As last resort, use stop to prevent further UI actions
+        try:
+            st.stop()
+        except Exception:
+            return
+
 def load_csv_with_encoding(file, use_lf=True, encoding='cp932') -> pd.DataFrame:
     """
     CSVファイルを読み込む（エンコーディングと改行コードを指定）
@@ -736,7 +758,7 @@ with col2:
     if st.button("🔄 クリア", key='clear_btn', help="アップロードしたファイルをクリア"):
         for k in list(st.session_state.keys()):
             del st.session_state[k]
-        st.experimental_rerun()
+        safe_rerun()
 
 if mode == "Full (8 files)":
     uploaded_files = st.file_uploader(
