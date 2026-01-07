@@ -29,6 +29,24 @@ st.set_page_config(
     page_icon="📦",
     layout="wide"
 )
+
+
+# --- Hide Streamlit default menu/footer/header (public-friendly) ---
+st.markdown(
+    """
+    <style>
+      #MainMenu {visibility: hidden;}
+      footer {visibility: hidden;}
+      header {visibility: hidden;}
+      [data-testid="stToolbar"] {visibility: hidden; height: 0px;}
+      [data-testid="stDecoration"] {visibility: hidden; height: 0px;}
+      [data-testid="stStatusWidget"] {visibility: hidden;}
+      [data-testid="stHeaderActionElements"] {display: none;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("🧪 事前チェックシステム")
 st.markdown("---")
 
@@ -788,6 +806,7 @@ def compare_with_current_inventory(giniepos_df: pd.DataFrame, current_df: pd.Dat
     )
     current_summary['CL実在庫数'] = pd.to_numeric(current_summary['CL実在庫数'], errors='coerce').fillna(0)
 
+    
     # マージ（Left Outer Join）
     result = giniepos_df.merge(
         current_summary[['保管場所CD', '事業CD', '商品CD', 'CL実在庫数']],
@@ -796,22 +815,29 @@ def compare_with_current_inventory(giniepos_df: pd.DataFrame, current_df: pd.Dat
         how='left'
     )
 
-    # マージできなかった場合は現在庫0扱い（PowerQueryでもnull→0相当）
-    result['CL実在庫数'] = result['CL実在庫数'].fillna(0)
+    # ---- 突合不可の扱い ----
+    # 現在庫が見つからない行は「在庫0」ではなく「突合不可」として分離する（マスタ不備等の誤判定防止）
+    unmatched = result['CL実在庫数'].isna()
 
-    # 判定（変動数 + 実在庫）
-    result['判定'] = result['変動数'] + result['CL実在庫数']
+    # 判定（変動数 + 実在庫）は、現在庫が見つかった行のみ計算
+    result['判定'] = pd.NA
+    result.loc[~unmatched, '判定'] = result.loc[~unmatched, '変動数'] + result.loc[~unmatched, 'CL実在庫数']
+
+    # 判定区分
+    result['判定区分'] = 'OK'
+    result.loc[unmatched, '判定区分'] = '突合不可'
+    result.loc[(~unmatched) & (result['判定'] < 0), '判定区分'] = '在庫不足'
 
     # 除外（PowerQuery準拠）
     result = result[~result['TMS商品CD'].str.contains('BB-RQ8POU1740', na=False)]
     result = result[~result['TMS商品CD'].str.contains('ZUA292', na=False)]
 
-    # 在庫不足のみ
-    result = result[result['判定'] < 0]
-
     # さらに除外
     result = result[~result['TMS商品CD'].str.contains('Z00014', na=False)]
     result = result[~result['TMS商品CD'].str.contains('POS-', na=False)]
+
+    # 返却は「在庫不足」または「突合不可」のみ（OKは表示しない）
+    result = result[result['判定区分'].isin(['在庫不足', '突合不可'])]
     return result
 
 
@@ -877,7 +903,7 @@ def _run_uri_prechecks(uri_file) -> Tuple[Dict[str, Any], str]:
 
 def _run_inventory_check(
     shiire_file, ido_file, uri_text: str, tana_file, current_file,
-    master_857001_file, master_857002_file, master_857003_file
+    master_857001_file, master_857002_file, master_857003_file, master_13000_file
 ) -> pd.DataFrame:
     masters = load_master_files(master_857001_file, master_857002_file, master_857003_file, master_13000_file)
 
@@ -952,12 +978,25 @@ def run_full_check(
         _progress("在庫不足チェック中...")
         inv_result = _run_inventory_check(
             shiire_file, ido_file, uri_text, tana_file, current_file,
-            master_857001_file, master_857002_file, master_857003_file
+            master_857001_file, master_857002_file, master_857003_file, master_13000_file
         )
 
-        result["inv"]["status"] = "NG" if (inv_result is not None and not inv_result.empty) else "OK"
-        result["inv"]["table"] = inv_result
-        result["inv"]["message"] = f"NG {len(inv_result)}件" if result["inv"]["status"] == "NG" else "OK"
+        
+        if inv_result is not None and not inv_result.empty:
+            result["inv"]["status"] = "NG"
+            # 件数内訳（在庫不足 / 突合不可）
+            shortage_cnt = int((inv_result.get('判定区分') == '在庫不足').sum()) if '判定区分' in inv_result.columns else len(inv_result)
+            unmatched_cnt = int((inv_result.get('判定区分') == '突合不可').sum()) if '判定区分' in inv_result.columns else 0
+            result["inv"]["table"] = inv_result
+            if '判定区分' in inv_result.columns:
+                result["inv"]["message"] = f"在庫不足 {shortage_cnt}件 / 突合不可 {unmatched_cnt}件"
+            else:
+                result["inv"]["message"] = f"NG {len(inv_result)}件"
+        else:
+            result["inv"]["status"] = "OK"
+            result["inv"]["table"] = inv_result
+            result["inv"]["message"] = "OK"
+
 
     except KeyError as e:
         # 必須列不足など：判定NGではなく「処理エラー」と明示（社内公開向け）
