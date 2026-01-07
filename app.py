@@ -97,7 +97,7 @@ def load_csv_with_encoding(file, use_lf=True, encoding='cp932') -> pd.DataFrame:
         st.error(f"CSVファイルの読み込みエラー: {str(e)}")
         return None
 
-def load_master_files(master_857001, master_857002, master_857003) -> Dict[str, pd.DataFrame]:  # NOSONAR
+def load_master_files(master_857001, master_857002, master_857003, master_13000=None) -> Dict[str, pd.DataFrame]:  # NOSONAR
     """
     3つのマスタCSVを読み込む（UTF-8 / UTF-8-SIG想定）
     列名の世代差（例: 変換前コード401 vs 変換前コード値01 など）を吸収する。
@@ -181,6 +181,20 @@ def load_master_files(master_857001, master_857002, master_857003) -> Dict[str, 
         if df is not None and not df.empty:
             df = normalize_columns(df)
             masters["857003"] = df
+
+
+    # 13000（商品構成マスタ：パック商品CD→内訳商品CD）
+    if master_13000:
+        df = load_csv_with_encoding(master_13000, use_lf=False, encoding="utf-8-sig")
+        if df is not None and not df.empty:
+            df = normalize_columns(df)
+            # 必須列を正規化（列名の前後空白などはnormalize_columnsで除去済み）
+            # 想定: ['パック商品CD','内訳商品CD','内訳商品名称']
+            # 文字列として扱う（前後空白/全角空白も除去）
+            for col in ["パック商品CD", "内訳商品CD", "内訳商品名称"]:
+                if col in df.columns:
+                    df[col] = normalize_text_series(df[col])
+            masters["13000"] = df
 
     return masters
 def drop_ag_column(df: pd.DataFrame) -> pd.DataFrame:
@@ -564,9 +578,16 @@ def process_uri_data(df: pd.DataFrame, masters: Dict[str, pd.DataFrame]) -> pd.D
     # マスタ857001とマージ（Left Outer Join）
     if '857001' in masters:
         df = df.merge(masters['857001'], on='取次店コード', how='left')
-    # 商品構成マスタとの突合は今回は未実施（マスタ未提供の想定）
-    # 商品コードをそのまま使用
+    # 商品構成マスタ_13000（パック商品CD→内訳商品CD）で展開（PowerQuery準拠）
+    # - 商品コードがパック商品CDに該当する場合、内訳商品CDに置き換える（行は内訳数だけ増える）
+    if '13000' in masters:
+        m13000 = masters['13000'].copy()
+        # 念のため必須列が揃っているか確認
+        if 'パック商品CD' in m13000.columns and '内訳商品CD' in m13000.columns:
+            df = df.merge(m13000, left_on='商品コード', right_on='パック商品CD', how='left')
     df['商品コードbk'] = df['商品コード']
+    if '内訳商品CD' in df.columns:
+        df['商品コード'] = df['内訳商品CD'].where((df['内訳商品CD'].notna()) & (df['内訳商品CD'] != ''), df['商品コードbk'])
     # マスタ857002とマージ
     if '857002' in masters:
         # 型を統一（文字列型に変換）
@@ -858,7 +879,7 @@ def _run_inventory_check(
     shiire_file, ido_file, uri_text: str, tana_file, current_file,
     master_857001_file, master_857002_file, master_857003_file
 ) -> pd.DataFrame:
-    masters = load_master_files(master_857001_file, master_857002_file, master_857003_file)
+    masters = load_master_files(master_857001_file, master_857002_file, master_857003_file, master_13000_file)
 
     shiire_df = load_csv_with_encoding(shiire_file, use_lf=False, encoding="cp932")
     ido_df = load_csv_with_encoding(ido_file, use_lf=False, encoding="cp932")
@@ -895,7 +916,7 @@ def _run_inventory_check(
 
 def run_full_check(
     shiire_file, ido_file, uri_file, tana_file, current_file,
-    master_857001_file, master_857002_file, master_857003_file,
+    master_857001_file, master_857002_file, master_857003_file, master_13000_file,
     progress_cb=None
 ):
     result = {
@@ -974,7 +995,7 @@ st.markdown("""
 <div class="precheck-upload-title"><span class="precheck-step">1</span>ファイルアップロード</div>
 """, unsafe_allow_html=True)
 
-st.info('8ファイルの解析は、PCの負荷やファイルサイズによって30〜60秒以上かかる場合があります。反応が遅くても少し待ってください。')
+st.info('9ファイルの解析は、PCの負荷やファイルサイズによって30〜60秒以上かかる場合があります。反応が遅くても少し待ってください。')
 # file_uploader を広くする（落としやすくする）
 st.markdown(
     """
@@ -1012,7 +1033,7 @@ uploaded_files = st.file_uploader(
     "ファイルを選択またはドラッグ&ドロップ",
     type=['csv', 'xlsx', 'xls'],
     accept_multiple_files=True,
-    help="在庫変動データ4ファイル + 現在庫照会 + マスタ3ファイル = 計8ファイル",
+    help="在庫変動データ4ファイル + 現在庫照会 + マスタ4ファイル = 計9ファイル",
     key=f"uploader_{st.session_state.uploader_version}"
 )
 
@@ -1033,6 +1054,8 @@ current_file = None
 master_857001_file = None
 master_857002_file = None
 master_857003_file = None
+
+master_13000_file = None
 
 if uploaded_files:
     for file in uploaded_files:
@@ -1061,6 +1084,9 @@ if uploaded_files:
         elif '857003' in filename:
             master_857003_file = file
 
+        elif '13000' in filename:
+            master_13000_file = file
+
         else:
             st.warning(f"⚠️ 不明なファイル: {filename}")
 
@@ -1076,13 +1102,14 @@ total_files = sum([
     current_file is not None,
     master_857001_file is not None,
     master_857002_file is not None,
-    master_857003_file is not None
+    master_857003_file is not None,
+    master_13000_file is not None
 ])
 
-if total_files < 8:
-    st.warning(f"⚠️ {total_files}/8ファイルが認識されました。全8ファイル必要です。")
+if total_files < 9:
+    st.warning(f"⚠️ {total_files}/9ファイルが認識されました。全9ファイル必要です。")
 else:
-    # 8ファイル揃ったら自動で処理（途中ログは出さない）
+    # 9ファイル揃ったら自動で処理（途中ログは出さない）
     # 同じファイルセットで二重実行しない
     sig_parts = [
         getattr(shiire_file, "name", None),
@@ -1107,7 +1134,7 @@ else:
         with st.spinner("解析中です（30〜60秒かかる場合があります）..."):
             st.session_state.processed_data = run_full_check(
                 shiire_file, ido_file, uri_file, tana_file, current_file,
-                master_857001_file, master_857002_file, master_857003_file, progress_cb=_ui_progress
+                master_857001_file, master_857002_file, master_857003_file, master_13000_file, progress_cb=_ui_progress
             )
         st.success("処理が完了しました")
         progress_box.empty()
