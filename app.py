@@ -1,47 +1,81 @@
+
 import streamlit as st
 import pandas as pd
 import io
 import unicodedata
-from typing import Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 import csv
 import hashlib
 import re
 from dataclasses import dataclass
 from datetime import datetime, date
 from io import StringIO
-from typing import Optional, Tuple
 
 # ページ設定
+
+# ----------------------------
+# Constants (column names etc.)
+# ----------------------------
+COL_TONYA = '取次店コード'
+COL_SHOHIN = '商品コード'
+COL_TMS = 'TMS商品CD'
+COL_HOKAN = '保管場所CD'
+COL_JIGYO = '事業CD'
+COL_INV_BEFORE = '受払前在庫数'
+COL_INV_AFTER = '受払後在庫数'
+
 st.set_page_config(
-    page_title="在庫不足チェックシステム",
+    page_title="事前チェックシステム",
     page_icon="📦",
     layout="wide"
 )
-
-st.title("📦 在庫不足チェックシステム")
+st.title("🧪 事前チェックシステム")
 st.markdown("---")
+
+# ----------------------------
+# Utilities
+# ----------------------------
+def normalize_key_series(s: pd.Series) -> pd.Series:
+    """PowerQueryのTrim相当: 前後空白（全角含む）・BOM等を除去し、突合キーのブレを防ぐ。"""
+    out = s.astype(str)
+    out = out.str.replace("\ufeff", "", regex=False)
+    out = out.str.replace("　", " ", regex=False)  # 全角スペース→半角
+    out = out.str.strip()
+    # 文字列化で混入する表現を空に寄せる
+    out = out.replace({"nan": "", "None": "", "NaN": ""})
+    return out
+
 
 # セッションステートの初期化
 if 'processed_data' not in st.session_state:
     st.session_state.processed_data = None
 
+# file_uploader reset key
+if 'uploader_version' not in st.session_state:
+    st.session_state.uploader_version = 0
 
 def safe_rerun() -> None:
     """Rerun the Streamlit script in a way compatible with multiple Streamlit versions."""
-    # Preferred API
+    # Newer Streamlit
+    if hasattr(st, "rerun"):
+        try:
+            st.rerun()
+            return
+        except Exception:
+            pass
+    # Older Streamlit
     if hasattr(st, "experimental_rerun"):
         try:
             st.experimental_rerun()
             return
         except Exception:
             pass
-
-    # Fallback: raise the internal RerunException
+    # Fallback: raise the internal RerunException (very old versions)
     try:
         from streamlit.runtime.scriptrunner.script_runner import RerunException
         raise RerunException()
     except Exception:
-        # As last resort, use stop to prevent further UI actions
+        # As last resort, stop to prevent further UI actions
         try:
             st.stop()
         except Exception:
@@ -63,53 +97,92 @@ def load_csv_with_encoding(file, use_lf=True, encoding='cp932') -> pd.DataFrame:
         st.error(f"CSVファイルの読み込みエラー: {str(e)}")
         return None
 
-def load_master_files(master_857001, master_857002, master_857003) -> Dict[str, pd.DataFrame]:
+def load_master_files(master_857001, master_857002, master_857003) -> Dict[str, pd.DataFrame]:  # NOSONAR
     """
-    3つのマスタファイルを読み込む（UTF-8、CRLF改行）
+    3つのマスタCSVを読み込む（UTF-8 / UTF-8-SIG想定）
+    列名の世代差（例: 変換前コード401 vs 変換前コード値01 など）を吸収する。
+    PowerQueryで行っていたTrim相当（前後空白除去・全角空白除去）もここで実施する。
     """
-    masters = {}
-    
+    def _nfkc(s: str) -> str:
+        return unicodedata.normalize("NFKC", s).replace("\ufeff", "").strip()
+
+    def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        df.columns = [_nfkc(str(c)) for c in df.columns]
+        return df
+
+    def normalize_text_series(s: pd.Series) -> pd.Series:
+        # Trim + 全角空白除去 + NFKC
+        return (
+            s.astype(str)
+             .map(lambda x: _nfkc(x).replace(" ", "").replace("　", ""))  # 半角/全角スペース除去
+        )
+
+    def pick_columns(df: pd.DataFrame, mapping: Dict[str, List[str]]) -> pd.DataFrame:
+        colmap: Dict[str, str] = {}
+        for dst, candidates in mapping.items():
+            found = None
+            for c in candidates:
+                if c in df.columns:
+                    found = c
+                    break
+            if found is None:
+                raise KeyError(
+                    f"マスタ列 '{dst}' が見つかりません。候補={candidates} / 実列={df.columns.tolist()}"
+                )
+            colmap[dst] = found
+        out = df[[colmap[k] for k in mapping.keys()]].copy()
+        out.columns = list(mapping.keys())
+        return out
+
+    masters: Dict[str, pd.DataFrame] = {}
+
+    # 857001（取次店→事業/保管場所など）
     if master_857001:
-        df = load_csv_with_encoding(master_857001, use_lf=False, encoding='utf-8')
-        if df is not None:
-            # マスタ857001の加工
-            df = df[['変換前コード値01', 'コード値1', 'コード値2', 'コード値4']].copy()
-            df = df.rename(columns={
-                '変換前コード値01': '取次店コード',
-                'コード値1': '店舗倉庫区分',
-                'コード値2': '事業CDｂｋ',
-                'コード値4': '保管場所CD'
+        df = load_csv_with_encoding(master_857001, use_lf=False, encoding="utf-8-sig")
+        if df is not None and not df.empty:
+            df = normalize_columns(df)
+            df = pick_columns(df, {
+                "取次店コード": ["変換前コード401", "変換前コード値01", "変換前コード01"],
+                "店舗倉庫区分": ["コード1", "コード値1"],
+                "事業CDＢＫ": ["コード2", "コード値2"],
+                "保管場所CD": ["コード4", "コード値4"],
             })
-            # 事業CDの計算: TGで始まるなら13000、それ以外は15000
-            df['事業CD'] = df['取次店コード'].apply(lambda x: '13000' if str(x).startswith('TG') else '15000')
-            df = df.drop_duplicates(subset=['取次店コード'])
-            masters['857001'] = df
-            st.success(f"✅ マスタ857001読み込み完了: {len(df)}行")
-    
+
+            # Trim相当
+            for c in ["取次店コード", "店舗倉庫区分", "事業CDＢＫ", "保管場所CD"]:
+                df[c] = normalize_text_series(df[c])
+
+            # 事業CDの決定（既存ロジック維持）
+            df["事業CD"] = df["取次店コード"].apply(lambda x: "13000" if str(x).startswith("TG") else "15000")
+            df = df.drop_duplicates(subset=["取次店コード"])
+            masters["857001"] = df
+
+    # 857002（商品コード→TMS商品CD 変換）
     if master_857002:
-        df = load_csv_with_encoding(master_857002, use_lf=False, encoding='utf-8')
-        if df is not None:
-            # マスタ857002の加工
-            df = df[['変換前コード値01', '変換前コード値02', 'コード値1']].copy()
-            df = df.rename(columns={
-                '変換前コード値01': '商品コード',
-                '変換前コード値02': '事業CD',
-                'コード値1': 'TMS商品CD'
+        df = load_csv_with_encoding(master_857002, use_lf=False, encoding="utf-8-sig")
+        if df is not None and not df.empty:
+            df = normalize_columns(df)
+            df = pick_columns(df, {
+                "商品コード": ["変換前コード401", "変換前コード値01", "変換前コード01"],
+                "事業CD": ["変換前コード402", "変換前コード値02", "変換前コード02"],
+                "TMS商品CD": ["コード1", "コード値1"],
             })
-            df = df.drop_duplicates(subset=['商品コード', '事業CD'])
-            masters['857002'] = df
-            st.success(f"✅ マスタ857002読み込み完了: {len(df)}行")
-    
+
+            for c in ["商品コード", "事業CD", "TMS商品CD"]:
+                df[c] = normalize_text_series(df[c])
+
+            df = df.drop_duplicates(subset=["商品コード", "事業CD"])
+            masters["857002"] = df
+
+    # 857003（その他コード変換等：加工せずに保持）
     if master_857003:
-        df = load_csv_with_encoding(master_857003, use_lf=False, encoding='utf-8')
-        if df is not None:
-            masters['857003'] = df
-            st.success(f"✅ マスタ857003読み込み完了: {len(df)}行")
-    
+        df = load_csv_with_encoding(master_857003, use_lf=False, encoding="utf-8-sig")
+        if df is not None and not df.empty:
+            df = normalize_columns(df)
+            masters["857003"] = df
+
     return masters
-
-
-### --- 以下 main.py から取り込んだユーティリティ関数 (売上前処理用) ---
 def drop_ag_column(df: pd.DataFrame) -> pd.DataFrame:
     """
     ExcelのAG列 = 33列目（1-based）= index 32（0-based）
@@ -120,11 +193,9 @@ def drop_ag_column(df: pd.DataFrame) -> pd.DataFrame:
         return df
     return df.drop(df.columns[ag_index], axis=1)
 
-
 def normalize_text(s: str) -> str:
     """半角・全角の揺れを吸収するために正規化する（NFKC）"""
     return unicodedata.normalize("NFKC", s)
-
 
 def split_docomo_shop_rows(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
@@ -136,23 +207,17 @@ def split_docomo_shop_rows(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame
     if df.shape[1] <= col_index:
         # 対象列がないので分離は行わない
         return df.copy(), pd.DataFrame()
-
     keyword = normalize_text("ドコモショップ")
-
     series = (
         df.iloc[:, col_index]
         .astype("string")
         .fillna("")
         .map(normalize_text)
     )
-
     mask = series.str.contains(keyword, na=False)
-
     kept_df = df[mask].copy()
     omitted_df = df[~mask].copy()
-
     return kept_df, omitted_df
-
 
 # --- main.py のチェック機能取り込み ---
 TARGET_COL_25 = 24
@@ -161,14 +226,12 @@ DATE_COL_9 = 8
 DATE_COL_17 = 16
 DATE_TIME_RE = re.compile(r"^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}$")
 
-
 @dataclass
 class ErrorDetail:
     row: int
     store_name: str
     slip_number: str
     col_38: str
-
 
 @dataclass
 class DateIssue:
@@ -180,7 +243,6 @@ class DateIssue:
     col17: str
     note: str
 
-
 @dataclass
 class DateSummary:
     total_checked_cells: int
@@ -188,9 +250,47 @@ class DateSummary:
     count_error: int
     issues: List[DateIssue]
 
-
 def csv_reader_from_text(csv_text: str):
     return csv.reader(StringIO(csv_text, newline=""))
+
+
+
+def load_csv_from_text(csv_text: str) -> pd.DataFrame:
+    """Read CSV content (already decoded to text) into a DataFrame.
+    Keep all columns as strings to avoid dtype surprises.
+    """
+    return pd.read_csv(StringIO(csv_text), dtype=str, keep_default_na=False)
+
+def load_current_inventory_excel(uploaded_file) -> pd.DataFrame:
+    """現在庫照会（商品別）ExcelをDataFrameとして読み込む。
+
+    - 1枚目シートを読み込む（PowerQuery運用と同じ前提）
+    - 列名の前後空白/BOM/全角スペースを除去
+    - 以降の処理（compare_with_current_inventory）が期待する列名
+      ['保管場所CD','事業CD','商品CD','実在庫数量'] を含むことを前提とする
+    """
+    if uploaded_file is None:
+        return pd.DataFrame()
+
+    try:
+        data = uploaded_file.getvalue()
+    except Exception:
+        # 念のため
+        data = uploaded_file.read()
+
+    df = pd.read_excel(io.BytesIO(data), sheet_name=0, dtype=str)
+
+    # 列名正規化（Trim相当 + BOM除去）
+    cols = []
+    for c in df.columns:
+        s = str(c)
+        s = s.replace("\ufeff", "")
+        s = s.replace("　", " ").strip()
+        cols.append(s)
+    df.columns = cols
+
+    return df
+
 
 
 def parse_dt_str(s: str) -> Optional[datetime]:
@@ -202,7 +302,6 @@ def parse_dt_str(s: str) -> Optional[datetime]:
     except Exception:
         return None
 
-
 def build_error_csv_bytes(details: List[ErrorDetail]) -> bytes:
     buf = StringIO()
     w = csv.writer(buf, lineterminator="\n")
@@ -210,7 +309,6 @@ def build_error_csv_bytes(details: List[ErrorDetail]) -> bytes:
     for d in details:
         w.writerow([d.row, d.store_name, d.slip_number, d.col_38])
     return buf.getvalue().encode("utf-8")
-
 
 def build_date_issue_csv_bytes(issues: List[DateIssue]) -> bytes:
     buf = StringIO()
@@ -220,12 +318,16 @@ def build_date_issue_csv_bytes(issues: List[DateIssue]) -> bytes:
         w.writerow([it.record_no, it.start_physical_line, it.severity, it.issue_type, it.col9, it.col17, it.note])
     return buf.getvalue().encode("utf-8")
 
-
-def check_and_analyze(csv_text: str) -> Tuple[bool, List[ErrorDetail], int, int, DateSummary]:
+def check_and_analyze(csv_text: str) -> Tuple[bool, List[ErrorDetail], int, int, DateSummary]:  # NOSONAR
+    """
+    売上CSVの事前検査。
+    - NG条件（25列=Z00014 かつ 38列が 3000/5000 以外）を検出
+    - 9列の日付フォーマットチェック
+    ※ 最小修正：全行をチェックするため、returnはループ外に移動
+    """
     error_details: List[ErrorDetail] = []
     total_data_records = 0
     total_physical_lines = 0
-
     total_checked_cells = 0
     count_col9_ok = 0
     count_error = 0
@@ -243,7 +345,6 @@ def check_and_analyze(csv_text: str) -> Tuple[bool, List[ErrorDetail], int, int,
         # skip header
         if record_no == 1:
             continue
-
         total_data_records += 1
 
         # NGチェック 25/38
@@ -252,7 +353,6 @@ def check_and_analyze(csv_text: str) -> Tuple[bool, List[ErrorDetail], int, int,
             col_11 = row[10].strip() if len(row) > 10 else ""
             col_25 = row[TARGET_COL_25].strip() if len(row) > TARGET_COL_25 else ""
             col_38 = row[TARGET_COL_38].strip() if len(row) > TARGET_COL_38 else ""
-
             if col_25 == "Z00014" and col_38 not in {"3000", "5000"}:
                 error_details.append(ErrorDetail(row=start_physical_line, store_name=col_3, slip_number=col_11, col_38=col_38))
 
@@ -261,16 +361,27 @@ def check_and_analyze(csv_text: str) -> Tuple[bool, List[ErrorDetail], int, int,
         dt9 = parse_dt_str(col9)
         if dt9 is None:
             count_error += 1
-            issues.append(DateIssue(record_no=total_data_records, start_physical_line=start_physical_line, severity="ERROR", issue_type="COL9_MISSING_OR_INVALID", col9=col9, col17="", note="9列目に yyyy/mm/dd hh:mm:ss が必要です。"))
+            issues.append(DateIssue(
+                record_no=total_data_records,
+                start_physical_line=start_physical_line,
+                severity="ERROR",
+                issue_type="COL9_MISSING_OR_INVALID",
+                col9=col9,
+                col17="",
+                note="9列目に yyyy/mm/dd hh:mm:ss が必要です。"
+            ))
         else:
             count_col9_ok += 1
-            total_checked_cells += 1
+        total_checked_cells += 1
 
-    date_summary = DateSummary(total_checked_cells=total_checked_cells, count_col9_ok=count_col9_ok, count_error=count_error, issues=issues)
-
+    # ループ終了後にサマリー作成して返す（←最小修正）
+    date_summary = DateSummary(
+        total_checked_cells=total_checked_cells,
+        count_col9_ok=count_col9_ok,
+        count_error=count_error,
+        issues=issues
+    )
     return (len(error_details) > 0), error_details, total_data_records, total_physical_lines, date_summary
-
-# --- end of main.py checks ---
 
 ### --- 取り込みここまで ---
 
@@ -280,68 +391,55 @@ def process_shiire_data(df: pd.DataFrame, masters: Dict[str, pd.DataFrame]) -> p
     """
     if df is None or df.empty:
         return pd.DataFrame()
-    
     # 型変換
     df['受払前在庫数'] = pd.to_numeric(df['受払前在庫数'], errors='coerce').fillna(0).astype(int)
     df['数量'] = pd.to_numeric(df['数量'], errors='coerce').fillna(0).astype(int)
     df['受払後在庫数'] = pd.to_numeric(df['受払後在庫数'], errors='coerce').fillna(0).astype(int)
-    
     # マスタ857001とマージ（Inner Join）
     if '857001' in masters:
         df = df.merge(masters['857001'], on='取次店コード', how='inner')
-    
     # 店舗倉庫区分でフィルタ
     df = df[df['店舗倉庫区分'] == '1']
-    
     # マスタ857002とマージ（Left Outer Join）
     if '857002' in masters:
         # 型を統一（文字列型に変換）
         df['事業CD'] = df['事業CD'].astype(str)
         master_857002 = masters['857002'].copy()
         master_857002['事業CD'] = master_857002['事業CD'].astype(str)
-        
         df = df.merge(master_857002, on=['事業CD', '商品コード'], how='left', suffixes=('', '_master'))
         # TMS商品CDがnullなら商品コードを使用
         df['TMS商品CD'] = df['TMS商品CD'].fillna(df['商品コード'])
     else:
         df['TMS商品CD'] = df['商品コード']
-    
     # 数量をバックアップ
     df['数量bk'] = df['数量']
-    
     # 受払種別でフィルタ
     valid_types = ['倉庫へ返品', '入荷', '入荷(システム自動)', '返品キャンセル', '返品不備']
     df = df[df['受払種別'].isin(valid_types)]
-    
     # 除外商品コード
     exclude_codes = ['ZUA292', 'ZUA34Q', 'ZUA34R', 'ZUA34S', 'ZUA34T', 'ZUA34U', 'ZUA34V', 'ZUA34W']
     for code in exclude_codes:
         df = df[~df['商品コード'].str.contains(code, na=False)]
-    
     return df
 
 def process_shiire_individual(df: pd.DataFrame) -> pd.DataFrame:
     """仕入データ（個体情報）"""
-    # IMEI、ICCID、その他シリアルのいずれかがある
+    # ← 最小修正：OR を追加（いずれかが非空なら対象）
     individual = df[
         (df['IMEI'].notna() & (df['IMEI'] != '')) |
         (df['ICCID'].notna() & (df['ICCID'] != '')) |
         (df['その他シリアル'].notna() & (df['その他シリアル'] != ''))
     ].copy()
-    
     # カテゴリ中がＵＳＩＭカードでない
     individual = individual[individual['カテゴリ中'] != 'ＵＳＩＭカード']
-    
     # 数量計算: 倉庫へ返品なら-1、それ以外は1
     individual['数量'] = individual['受払種別'].apply(lambda x: -1 if x == '倉庫へ返品' else 1)
-    
     # グループ化
     result = individual.groupby(
         ['取次店コード', '取次店名', '事業CD', '保管場所CD', '商品コード', 'TMS商品CD'],
         dropna=False
     )['数量'].sum().reset_index()
     result = result.rename(columns={'数量': '変動数'})
-    
     return result
 
 def process_shiire_accessory(df: pd.DataFrame) -> pd.DataFrame:
@@ -352,17 +450,14 @@ def process_shiire_accessory(df: pd.DataFrame) -> pd.DataFrame:
         (df['ICCID'].isna() | (df['ICCID'] == '')) &
         (df['その他シリアル'].isna() | (df['その他シリアル'] == ''))
     ].copy()
-    
     # 数量bkを使用
     accessory['数量'] = accessory['数量bk']
-    
     # グループ化
     result = accessory.groupby(
         ['取次店コード', '取次店名', '事業CD', '保管場所CD', '商品コード', 'TMS商品CD'],
         dropna=False
     )['数量'].sum().reset_index()
     result = result.rename(columns={'数量': '変動数'})
-    
     return result
 
 def process_ido_data(df: pd.DataFrame, masters: Dict[str, pd.DataFrame]) -> pd.DataFrame:
@@ -371,15 +466,12 @@ def process_ido_data(df: pd.DataFrame, masters: Dict[str, pd.DataFrame]) -> pd.D
     """
     if df is None or df.empty:
         return pd.DataFrame()
-    
     # 型変換
     df['入庫予定数'] = pd.to_numeric(df['入庫予定数'], errors='coerce').fillna(0).astype(int)
     df['未入庫数'] = pd.to_numeric(df['未入庫数'], errors='coerce').fillna(0).astype(int)
-    
     # 不要な列を削除（空の列）
     df = df.loc[:, ~df.columns.str.startswith('_')]
     df = df.loc[:, df.columns != '']
-    
     # 移動元取次店コードでマスタ857001とマージ（Inner Join）
     if '857001' in masters:
         moto_master = masters['857001'].copy()
@@ -390,7 +482,6 @@ def process_ido_data(df: pd.DataFrame, masters: Dict[str, pd.DataFrame]) -> pd.D
             '保管場所CD': '移動元保管場所CD'
         })
         df = df.merge(moto_master, on='移動元取次店コード', how='inner')
-    
     # 移動先取次店コードでマスタ857001とマージ（Inner Join）
     if '857001' in masters:
         saki_master = masters['857001'][['取次店コード', '事業CD', '保管場所CD']].copy()
@@ -400,14 +491,12 @@ def process_ido_data(df: pd.DataFrame, masters: Dict[str, pd.DataFrame]) -> pd.D
             '保管場所CD': '移動先保管場所CD'
         })
         df = df.merge(saki_master, on='移動先取次店コード', how='inner')
-    
     # マスタ857002とマージ
     if '857002' in masters:
         # 型を統一（文字列型に変換）
         df['移動元事業CD'] = df['移動元事業CD'].astype(str)
         master_857002 = masters['857002'].copy()
         master_857002['事業CD'] = master_857002['事業CD'].astype(str)
-        
         df = df.merge(
             master_857002,
             left_on=['移動元事業CD', '商品コード'],
@@ -420,19 +509,16 @@ def process_ido_data(df: pd.DataFrame, masters: Dict[str, pd.DataFrame]) -> pd.D
             df = df.drop(columns=['事業CD_master'])
     else:
         df['TMS商品CD'] = df['商品コード']
-    
     return df
 
 def process_ido_shukko(df: pd.DataFrame) -> pd.DataFrame:
     """移動データ（出庫）"""
     # カテゴリ中がＵＳＩＭカードでない
     shukko = df[~df['カテゴリ中'].str.contains('ＵＳＩＭカード', na=False)].copy()
-    
     # 数量計算: 入庫予定数 * -1
     shukko['数量'] = shukko['入庫予定数'] * -1
     shukko['取次店コード'] = shukko['移動元取次店コード']
     shukko['取次店名'] = shukko['移動元取次店名']
-    
     # グループ化
     result = shukko.groupby(
         ['取次店コード', '取次店名', '移動元事業CD', '移動元保管場所CD', '商品コード', 'TMS商品CD'],
@@ -443,22 +529,18 @@ def process_ido_shukko(df: pd.DataFrame) -> pd.DataFrame:
         '移動元保管場所CD': '保管場所CD',
         '数量': '変動数'
     })
-    
     # 保管場所CDが空でない
     result = result[result['保管場所CD'] != '']
-    
     return result
 
 def process_ido_nyuko(df: pd.DataFrame) -> pd.DataFrame:
     """移動データ（入庫）"""
     # カテゴリ中がＵＳＩＭカードでない
     nyuko = df[~df['カテゴリ中'].str.contains('ＵＳＩＭカード', na=False)].copy()
-    
     # 数量計算: 入庫予定数 * 1
     nyuko['数量'] = nyuko['入庫予定数'] * 1
     nyuko['取次店コード'] = nyuko['移動先取次店コード']
     nyuko['取次店名'] = nyuko['移動先取次店名']
-    
     # グループ化
     result = nyuko.groupby(
         ['取次店コード', '取次店名', '移動先事業CD', '移動先保管場所CD', '商品コード', 'TMS商品CD'],
@@ -469,10 +551,8 @@ def process_ido_nyuko(df: pd.DataFrame) -> pd.DataFrame:
         '移動先保管場所CD': '保管場所CD',
         '数量': '変動数'
     })
-    
     # 保管場所CDが空でない
     result = result[result['保管場所CD'] != '']
-    
     return result
 
 def process_uri_data(df: pd.DataFrame, masters: Dict[str, pd.DataFrame]) -> pd.DataFrame:
@@ -481,131 +561,108 @@ def process_uri_data(df: pd.DataFrame, masters: Dict[str, pd.DataFrame]) -> pd.D
     """
     if df is None or df.empty:
         return pd.DataFrame()
-    
     # マスタ857001とマージ（Left Outer Join）
     if '857001' in masters:
         df = df.merge(masters['857001'], on='取次店コード', how='left')
-    
-    # 商品構成マスタとのマージは省略（マスタがない場合）
+    # 商品構成マスタとの突合は今回は未実施（マスタ未提供の想定）
     # 商品コードをそのまま使用
     df['商品コードbk'] = df['商品コード']
-    
     # マスタ857002とマージ
     if '857002' in masters:
         # 型を統一（文字列型に変換）
         df['事業CD'] = df['事業CD'].astype(str)
         master_857002 = masters['857002'].copy()
         master_857002['事業CD'] = master_857002['事業CD'].astype(str)
-        
         df = df.merge(master_857002, on=['事業CD', '商品コード'], how='left', suffixes=('', '_master'))
         df['TMS商品CD'] = df['TMS商品CD'].fillna(df['商品コード'])
     else:
         df['TMS商品CD'] = df['商品コード']
-    
     # 数量計算: 収納種別が「販売」なら-1、それ以外は1
     df['数量'] = df['収納種別'].apply(lambda x: -1 if x == '販売' else 1)
-    
     return df
 
 def process_uri_individual(df: pd.DataFrame) -> pd.DataFrame:
     """売上データ（個体情報）"""
-    # 必要な列が無い場合は空文字列列を作る（入力データによっては列名が存在しないことがある）
+    # 必要な列が無い場合は空文字列列を作成（入力データによっては列名が存在しないことがある）
     needed = ['メーカー', '業務種別', '店舗名', '取次店コード', '事業CD', '保管場所CD', '商品コード', 'TMS商品CD']
     for col in needed:
         if col not in df.columns:
             df[col] = ''
-
-    # メーカーがある かつ Apple Inc.-SBSとｿﾌﾄﾊﾞﾝｸｾﾚｸｼｮﾝでない
+    # メーカーがある かつ Apple Inc.-SBS と ｱｯﾌﾟﾙ-SBS 以外
     individual = df[
         (df['メーカー'].notna()) &
         (df['メーカー'] != '') &
         (df['メーカー'] != 'Apple Inc.-SBS') &
-        (df['メーカー'] != 'ｿﾌﾄﾊﾞﾝｸｾﾚｸｼｮﾝ')
+        (df['メーカー'] != 'ｱｯﾌﾟﾙ-SBS')
     ].copy()
-    
     # 業務種別にＵＳＩＭを含まない
     individual = individual[~individual['業務種別'].str.contains('ＵＳＩＭ', na=False)]
-    
     individual['取次店名'] = individual['店舗名']
-
     # 数量列が無ければ作成（通常は process_uri_data で作成される）
     if '数量' not in individual.columns:
         if '収納種別' in individual.columns:
             individual['数量'] = individual['収納種別'].apply(lambda x: -1 if x == '販売' else 1)
         else:
             individual['数量'] = 0
-
     # グループ化
     result = individual.groupby(
         ['取次店コード', '取次店名', '事業CD', '保管場所CD', '商品コード', 'TMS商品CD'],
         dropna=False
     )['数量'].sum().reset_index()
     result = result.rename(columns={'数量': '変動数'})
-    
     return result
 
 def process_uri_sb_accessory(df: pd.DataFrame) -> pd.DataFrame:
     """売上データ（SBアクセサリ）"""
-    # 必要な列が無い場合は空文字列列を作る
+    # 必要な列が無い場合は空文字列列を作成
     if '取次店コード' not in df.columns:
         df['取次店コード'] = ''
     if 'メーカー' not in df.columns:
         df['メーカー'] = ''
-
     # 取次店コードがTGで始まる
     sb_acc = df[df['取次店コード'].str.startswith('TG', na=False)].copy()
-    
-    # メーカーがApple Inc.-SBSまたはｿﾌﾄﾊﾞﾝｸｾﾚｸｼｮﾝ
+    # メーカーが Apple Inc.-SBS または ｱｯﾌﾟﾙ-SBS ← 最小修正：OR を追加
     sb_acc = sb_acc[
         (sb_acc['メーカー'] == 'Apple Inc.-SBS') |
-        (sb_acc['メーカー'] == 'ｿﾌﾄﾊﾞﾝｸｾﾚｸｼｮﾝ')
+        (sb_acc['メーカー'] == 'ｱｯﾌﾟﾙ-SBS')
     ]
-    
-    sb_acc['取次店名'] = sb_acc['店舗名']
-
+    sb_acc['取次店名'] = sb_acc['店舗名'] if '店舗名' in sb_acc.columns else ''
     # 数量列が無ければ作成
     if '数量' not in sb_acc.columns:
         if '収納種別' in sb_acc.columns:
             sb_acc['数量'] = sb_acc['収納種別'].apply(lambda x: -1 if x == '販売' else 1)
         else:
             sb_acc['数量'] = 0
-
     # グループ化
     result = sb_acc.groupby(
         ['取次店コード', '取次店名', '事業CD', '保管場所CD', '商品コード', 'TMS商品CD'],
         dropna=False
     )['数量'].sum().reset_index()
     result = result.rename(columns={'数量': '変動数'})
-    
     return result
 
 def process_uri_service(df: pd.DataFrame) -> pd.DataFrame:
     """売上データ（サービス）"""
-    # 必要な列が無い場合は空文字列列を作る
+    # 必要な列が無い場合は空文字列列を作成
     if '商品分類' not in df.columns:
         df['商品分類'] = ''
     if '店舗名' not in df.columns:
         df['店舗名'] = ''
-
     # 商品分類が「サービス」
     service = df[df['商品分類'] == 'サービス'].copy()
-    
     service['取次店名'] = service['店舗名']
-
     # 数量列が無ければ作成
     if '数量' not in service.columns:
         if '収納種別' in service.columns:
             service['数量'] = service['収納種別'].apply(lambda x: -1 if x == '販売' else 1)
         else:
             service['数量'] = 0
-
     # グループ化
     result = service.groupby(
         ['取次店コード', '取次店名', '事業CD', '保管場所CD', '商品コード', 'TMS商品CD'],
         dropna=False
     )['数量'].sum().reset_index()
     result = result.rename(columns={'数量': '変動数'})
-    
     return result
 
 def process_tana_data(df: pd.DataFrame, masters: Dict[str, pd.DataFrame]) -> pd.DataFrame:
@@ -614,166 +671,358 @@ def process_tana_data(df: pd.DataFrame, masters: Dict[str, pd.DataFrame]) -> pd.
     """
     if df is None or df.empty:
         return pd.DataFrame()
-    
     # マスタ857001とマージ（Inner Join）
     if '857001' in masters:
         df = df.merge(masters['857001'], on='取次店コード', how='inner')
-    
     # 型変換
     df['受払前在庫数'] = pd.to_numeric(df['受払前在庫数'], errors='coerce').fillna(0).astype(int)
     df['数量'] = pd.to_numeric(df['数量'], errors='coerce').fillna(0).astype(int)
     df['受払後在庫数'] = pd.to_numeric(df['受払後在庫数'], errors='coerce').fillna(0).astype(int)
-    
     # 不要な列を削除
     df = df.loc[:, ~df.columns.str.startswith('_')]
     df = df.loc[:, df.columns != '']
-    
     # 店舗倉庫区分でフィルタ
     df = df[df['店舗倉庫区分'] == '1']
-    
     # マスタ857002とマージ
     if '857002' in masters:
         # 型を統一（文字列型に変換）
         df['事業CD'] = df['事業CD'].astype(str)
         master_857002 = masters['857002'].copy()
         master_857002['事業CD'] = master_857002['事業CD'].astype(str)
-        
         df = df.merge(master_857002, on=['事業CD', '商品コード'], how='left', suffixes=('', '_master'))
         df['TMS商品CD'] = df['TMS商品CD'].fillna(df['商品コード'])
     else:
         df['TMS商品CD'] = df['商品コード']
-    
     # 除外商品コード
     exclude_codes = ['ZUA292', 'ZUA34Q', 'ZUA34R', 'ZUA34S', 'ZUA34T', 'ZUA34U', 'ZUA34V', 'ZUA34W']
     for code in exclude_codes:
         df = df[~df['商品コード'].str.contains(code, na=False)]
-    
     return df
 
 def process_tana_grouped(df: pd.DataFrame) -> pd.DataFrame:
     """棚卸データ（グループ化）"""
     # カテゴリ中がＵＳＩＭカードでない
     grouped = df[~df['カテゴリ中'].str.contains('ＵＳＩＭカード', na=False)].copy()
-    
     # グループ化
     result = grouped.groupby(
         ['取次店コード', '取次店名', '事業CD', '保管場所CD', '商品コード', 'TMS商品CD'],
         dropna=False
     )['数量'].sum().reset_index()
     result = result.rename(columns={'数量': '変動数'})
-    
     return result
 
-def combine_all_data(shiire_ind, shiire_acc, ido_shukko, ido_nyuko, 
+def combine_all_data(shiire_ind, shiire_acc, ido_shukko, ido_nyuko,
                      uri_ind, uri_sb, uri_service, tana_grouped) -> pd.DataFrame:
     """
     全データを結合してTMS商品CDで集計（GINIEPOS変動数）
     """
     all_dfs = []
-    
     for df in [shiire_ind, shiire_acc, ido_shukko, ido_nyuko, uri_ind, uri_sb, uri_service, tana_grouped]:
         if df is not None and not df.empty:
             all_dfs.append(df)
-    
     if not all_dfs:
         return pd.DataFrame()
-    
     # 全て結合
     combined = pd.concat(all_dfs, ignore_index=True)
-    
     # TMS商品CDでグループ化して合計
     result = combined.groupby(
         ['取次店コード', '取次店名', '事業CD', '保管場所CD', 'TMS商品CD'],
         dropna=False
     )['変動数'].sum().reset_index()
-    
     # ソート
     result = result.sort_values('取次店コード').reset_index(drop=True)
-    
     return result
 
 def compare_with_current_inventory(giniepos_df: pd.DataFrame, current_df: pd.DataFrame) -> pd.DataFrame:
     """
     GINIEPOS変動数と現在庫照会を比較（判定結果）
+    - PowerQuery準拠で、キー列はTRIM相当（前後空白/全角空白除去）して突合ズレを防ぐ
+    - 現在庫の実在庫数量（文字の場合あり）を数値化して判定に使用する
     """
     if giniepos_df is None or giniepos_df.empty or current_df is None or current_df.empty:
         return pd.DataFrame()
-    
+
     # 現在庫照会から必要な列のみ取得
-    current_summary = current_df[['保管場所CD', '事業CD', '商品CD', '実在庫数量']].copy()
-    
-    # 型を統一（文字列型に変換）
-    giniepos_df['事業CD'] = giniepos_df['事業CD'].astype(str)
-    current_summary['事業CD'] = current_summary['事業CD'].astype(str)
-    current_summary['保管場所CD'] = current_summary['保管場所CD'].astype(str)
-    current_summary['商品CD'] = current_summary['商品CD'].astype(str)
-    giniepos_df['保管場所CD'] = giniepos_df['保管場所CD'].astype(str)
-    giniepos_df['TMS商品CD'] = giniepos_df['TMS商品CD'].astype(str)
-    
+    required_cols = ['保管場所CD', '事業CD', '商品CD', '実在庫数量']
+    missing = [c for c in required_cols if c not in current_df.columns]
+    if missing:
+        raise KeyError(f"現在庫照会ファイルに必要な列が見つかりません: {missing} / 実列={list(current_df.columns)}")
+
+    current_summary = current_df[required_cols].copy()
+
+    # ---- キー列の正規化（PowerQueryのTrim相当） ----
+    for c in ['事業CD', '保管場所CD', '商品CD']:
+        current_summary[c] = normalize_key_series(current_summary[c])
+    for c in ['事業CD', '保管場所CD', 'TMS商品CD']:
+        giniepos_df[c] = normalize_key_series(giniepos_df[c])
+
+    # ---- 在庫数量の数値化（文字→数値） ----
+    # カンマ区切り/空白混入を許容
+    current_summary['CL実在庫数'] = (
+        current_summary['実在庫数量']
+        .astype(str)
+        .str.replace(',', '', regex=False)
+        .str.replace('　', ' ', regex=False)
+        .str.strip()
+    )
+    current_summary['CL実在庫数'] = pd.to_numeric(current_summary['CL実在庫数'], errors='coerce').fillna(0)
+
     # マージ（Left Outer Join）
     result = giniepos_df.merge(
-        current_summary,
+        current_summary[['保管場所CD', '事業CD', '商品CD', 'CL実在庫数']],
         left_on=['保管場所CD', '事業CD', 'TMS商品CD'],
         right_on=['保管場所CD', '事業CD', '商品CD'],
         how='left'
     )
-    
-    # CL実在庫数と呼ぶ
-    result = result.rename(columns={'実在庫数量': 'CL実在庫数'})
-    
-    # nullは0に置換
+
+    # マージできなかった場合は現在庫0扱い（PowerQueryでもnull→0相当）
     result['CL実在庫数'] = result['CL実在庫数'].fillna(0)
-    
-    # 判定 = 変動数 + CL実在庫数
+
+    # 判定（変動数 + 実在庫）
     result['判定'] = result['変動数'] + result['CL実在庫数']
-    
-    # パスマネ等を除外（判定前）
+
+    # 除外（PowerQuery準拠）
     result = result[~result['TMS商品CD'].str.contains('BB-RQ8POU1740', na=False)]
     result = result[~result['TMS商品CD'].str.contains('ZUA292', na=False)]
-    
-    # 在庫不足の判定（判定 < 0）
+
+    # 在庫不足のみ
     result = result[result['判定'] < 0]
-    
-    # POS-、Z00014を除外（在庫不足抽出後）
+
+    # さらに除外
     result = result[~result['TMS商品CD'].str.contains('Z00014', na=False)]
     result = result[~result['TMS商品CD'].str.contains('POS-', na=False)]
-    
+    return result
+
+
+
+def _decode_upload_text(upload_file) -> str:
+    data = upload_file.getvalue()
+    try:
+        return data.decode("utf-8-sig")
+    except Exception:
+        return data.decode("cp932", errors="replace")
+
+
+def _build_charge_error_df(err_details: List[ErrorDetail]) -> pd.DataFrame:
+    return pd.DataFrame([{
+        "行番号(物理行)": d.row,
+        "店舗名": d.store_name,
+        "伝票番号": d.slip_number,
+        "金額(38列目)": d.col_38
+    } for d in err_details])
+
+
+def _build_date_issue_df(date_summary: DateSummary) -> pd.DataFrame:
+    return pd.DataFrame([{
+        "レコード番号": it.record_no,
+        "開始行(物理行)": it.start_physical_line,
+        "終了行(物理行)": it.end_physical_line,
+        "9列目の値": it.col9,
+        "補足": it.note
+    } for it in date_summary.issues])
+
+
+def _run_uri_prechecks(uri_file) -> Tuple[Dict[str, Any], str]:
+    result_part = {
+        "charge": {"status": "未実行", "table": None, "message": ""},
+        "date":   {"status": "未実行", "table": None, "message": ""},
+    }
+
+    uri_text = _decode_upload_text(uri_file)
+    err_flag, err_details, _, _, date_summary = check_and_analyze(uri_text)
+
+    # チャージ金額チェック
+    if err_flag:
+        df_err = _build_charge_error_df(err_details)
+        result_part["charge"]["status"] = "NG"
+        result_part["charge"]["table"] = df_err
+        result_part["charge"]["message"] = f"NG {len(df_err)}件"
+    else:
+        result_part["charge"]["status"] = "OK"
+        result_part["charge"]["message"] = "OK"
+
+    # 日付チェック
+    if date_summary.count_error > 0:
+        df_issue = _build_date_issue_df(date_summary)
+        result_part["date"]["status"] = "NG"
+        result_part["date"]["table"] = df_issue
+        result_part["date"]["message"] = f"NG {len(df_issue)}件"
+    else:
+        result_part["date"]["status"] = "OK"
+        result_part["date"]["message"] = "OK"
+
+    return result_part, uri_text
+
+
+def _run_inventory_check(
+    shiire_file, ido_file, uri_text: str, tana_file, current_file,
+    master_857001_file, master_857002_file, master_857003_file
+) -> pd.DataFrame:
+    masters = load_master_files(master_857001_file, master_857002_file, master_857003_file)
+
+    shiire_df = load_csv_with_encoding(shiire_file, use_lf=False, encoding="cp932")
+    ido_df = load_csv_with_encoding(ido_file, use_lf=False, encoding="cp932")
+    tana_df = load_csv_with_encoding(tana_file, use_lf=False, encoding="cp932")
+
+    uri_df = load_csv_from_text(uri_text)
+    current_df = load_current_inventory_excel(current_file)
+
+    shiire_processed = process_shiire_data(shiire_df, masters)
+    shiire_individual = process_shiire_individual(shiire_processed)
+    shiire_accessory = process_shiire_accessory(shiire_processed)
+
+    ido_processed = process_ido_data(ido_df, masters)
+    ido_shukko = process_ido_shukko(ido_processed)
+    ido_nyuko = process_ido_nyuko(ido_processed)
+
+    uri_processed = process_uri_data(uri_df, masters)
+    uri_individual = process_uri_individual(uri_processed)
+    uri_sb = process_uri_sb_accessory(uri_processed)
+    uri_service = process_uri_service(uri_processed)
+
+    tana_processed = process_tana_data(tana_df, masters)
+    tana_grouped = process_tana_grouped(tana_processed)
+
+    merged_hendo = combine_all_data(
+        shiire_individual, shiire_accessory,
+        ido_shukko, ido_nyuko,
+        uri_individual, uri_sb, uri_service,
+        tana_grouped
+    )
+
+    return compare_with_current_inventory(merged_hendo, current_df)
+
+
+def run_full_check(
+    shiire_file, ido_file, uri_file, tana_file, current_file,
+    master_857001_file, master_857002_file, master_857003_file,
+    progress_cb=None
+):
+    result = {
+        "charge": {"label": "チャージ金額チェック", "status": "未実行", "table": None, "message": ""},
+        "date":   {"label": "売上日付チェック",     "status": "未実行", "table": None, "message": ""},
+        "inv":    {"label": "在庫不足チェック",     "status": "未実行", "table": None, "message": ""},
+    }
+
+    def _progress(msg: str) -> None:
+        if progress_cb:
+            try:
+                progress_cb(msg)
+            except Exception:
+                pass
+
+    # ---- URI事前チェック ----
+    try:
+        _progress("売上CSVの事前チェック中...")
+        uri_part, uri_text = _run_uri_prechecks(uri_file)
+        for k in ["charge", "date"]:
+            result[k].update(uri_part[k])
+
+        if result["charge"]["status"] == "NG" or result["date"]["status"] == "NG":
+            return result
+
+    except Exception as e:
+        result["charge"]["status"] = "NG"
+        result["charge"]["message"] = f"売上ファイル解析エラー: {e}"
+        return result
+
+    # ---- 在庫不足チェック ----
+    try:
+        _progress("在庫不足チェック中...")
+        inv_result = _run_inventory_check(
+            shiire_file, ido_file, uri_text, tana_file, current_file,
+            master_857001_file, master_857002_file, master_857003_file
+        )
+
+        result["inv"]["status"] = "NG" if (inv_result is not None and not inv_result.empty) else "OK"
+        result["inv"]["table"] = inv_result
+        result["inv"]["message"] = f"NG {len(inv_result)}件" if result["inv"]["status"] == "NG" else "OK"
+
+    except KeyError as e:
+        # 必須列不足など：判定NGではなく「処理エラー」と明示（社内公開向け）
+        result["inv"]["status"] = "NG"
+        result["inv"]["table"] = pd.DataFrame()
+        result["inv"]["message"] = f"在庫不足チェック（処理エラー）: {e}"
+
+    except Exception as e:
+        result["inv"]["status"] = "NG"
+        result["inv"]["table"] = pd.DataFrame()
+        result["inv"]["message"] = f"在庫不足チェック（処理エラー）: {e}"
+
     return result
 
 # ファイルアップロードセクション
-st.header("1️⃣ ファイルアップロード")
+st.markdown("""
+<style>
+/* アップロード見出しをコンパクトに */
+.precheck-upload-title{
+  font-size: 1.25rem;
+  font-weight: 700;
+  margin: 0.2rem 0 0.6rem 0;
+  line-height: 1.2;
+}
+.precheck-step{
+  display:inline-block;
+  font-size:0.95rem;
+  font-weight:700;
+  padding:2px 10px;
+  border-radius:999px;
+  background:#eef2ff;
+  margin-right:10px;
+}
+</style>
+<div class="precheck-upload-title"><span class="precheck-step">1</span>ファイルアップロード</div>
+""", unsafe_allow_html=True)
 
-# シンプル表示: Full (8 files) のみ
-col1, col2 = st.columns([4, 1])
-with col1:
-    st.markdown("**📁 必要な8つのファイルをまとめてドラッグ＆ドロップしてください**")
-    # 視覚的ドロップエリア（表示用）
-    st.markdown(
-        """
-<div style='border:2px dashed #bbb; border-radius:8px; padding:18px; min-height:220px; display:flex; align-items:center; justify-content:center;'>
-  <div style='text-align:center; color:#666;'>
-    <div style='font-size:16px; font-weight:600;'>Drag and drop files here</div>
-    <div style='font-size:12px; margin-top:6px;'>在庫変動データ4つ + 現在庫照会 + マスタ3つ = 合計8ファイル</div>
-  </div>
-</div>
-        """,
-        unsafe_allow_html=True,
-    )
+st.info('8ファイルの解析は、PCの負荷やファイルサイズによって30〜60秒以上かかる場合があります。反応が遅くても少し待ってください。')
+# file_uploader を広くする（落としやすくする）
+st.markdown(
+    """
+<style>
+/* Make the file drop zone taller and easier to use (robust across Streamlit versions) */
+div[data-testid="stFileUploader"]{
+    min-height: 240px;
+}
+div[data-testid="stFileUploader"] > div{
+    min-height: 240px;
+}
+div[data-testid="stFileUploader"] section{
+    padding-top: 24px;
+    padding-bottom: 24px;
+}
+div[data-testid="stFileUploader"] section > div{
+    min-height: 240px;
+    display: flex;
+    align-items: center;
+}
+/* Newer Streamlit builds use a dedicated dropzone testid */
+div[data-testid="stFileUploaderDropzone"]{
+    min-height: 240px !important;
+    padding-top: 24px;
+    padding-bottom: 24px;
+    display: flex;
+    align-items: center;
+}
+</style>
+""",
+    unsafe_allow_html=True,
+)
 
-with col2:
-    if st.button("🔄 クリア", key='clear_btn', help="アップロードしたファイルをクリア"):
-        for k in list(st.session_state.keys()):
-            del st.session_state[k]
-        safe_rerun()
-
-# 実際のアップローダ（見た目とは別に機能する）
 uploaded_files = st.file_uploader(
     "ファイルを選択またはドラッグ&ドロップ",
     type=['csv', 'xlsx', 'xls'],
     accept_multiple_files=True,
     help="在庫変動データ4ファイル + 現在庫照会 + マスタ3ファイル = 計8ファイル",
-    key='uploader'
+    key=f"uploader_{st.session_state.uploader_version}"
 )
+
+
+# クリア（結果だけ消して初期状態に戻す）
+if st.button("🔄 クリア", key="clear_btn", help="結果とアップロード状態をクリアして初期表示に戻します"):
+    st.session_state.processed_data = None
+    st.session_state.last_full_sig = None
+    st.session_state.uploader_version += 1
+    safe_rerun()
 
 # ファイル名からファイルを振り分け
 shiire_file = None
@@ -786,250 +1035,123 @@ master_857002_file = None
 master_857003_file = None
 
 if uploaded_files:
-    st.subheader("📋 アップロード済みファイル")
-    
     for file in uploaded_files:
         filename = file.name
-        
         if 'SHI' in filename.upper():
             shiire_file = file
-            st.success(f"✅ 仕入データ: {filename}")
+
         elif 'IDO' in filename.upper():
             ido_file = file
-            st.success(f"✅ 移動データ: {filename}")
+
         elif 'URI' in filename.upper():
             uri_file = file
-            st.success(f"✅ 売上データ: {filename}")
+
         elif 'TNA' in filename.upper():
             tana_file = file
-            st.success(f"✅ 棚卸データ: {filename}")
+
         elif '現在庫' in filename or 'ZAIKO' in filename.upper():
             current_file = file
-            st.success(f"✅ 現在庫照会: {filename}")
+
         elif '857001' in filename:
             master_857001_file = file
-            st.success(f"✅ マスタ857001（取次店）: {filename}")
+
         elif '857002' in filename:
             master_857002_file = file
-            st.success(f"✅ マスタ857002（商品コード）: {filename}")
+
         elif '857003' in filename:
             master_857003_file = file
-            st.success(f"✅ マスタ857003（仕入先）: {filename}")
+
         else:
             st.warning(f"⚠️ 不明なファイル: {filename}")
-    
+
     # ファイル数チェック
-    total_files = sum([
-        shiire_file is not None,
-        ido_file is not None,
-        uri_file is not None,
-        tana_file is not None,
-        current_file is not None,
-        master_857001_file is not None,
-        master_857002_file is not None,
-        master_857003_file is not None
-    ])
-    
-    if total_files < 8:
-        st.warning(f"⚠️ {total_files}/8ファイルが認識されました。全8ファイル必要です。")
-    else:
-        st.success("✅ 全8ファイルが揃いました！")
 
-st.markdown("---")
 
-# 自動実行: 全8ファイルが揃ったら自動で処理を走らせる
-def run_full_check(shiire_file, ido_file, uri_file, tana_file, current_file, master_857001_file, master_857002_file, master_857003_file):
-    if not all([shiire_file, ido_file, uri_file, tana_file, current_file]):
-        st.error("⚠️ 在庫変動データと現在庫照会ファイルは必須です")
-        return
+# 必要ファイル数チェック
+total_files = sum([
+    shiire_file is not None,
+    ido_file is not None,
+    uri_file is not None,
+    tana_file is not None,
+    current_file is not None,
+    master_857001_file is not None,
+    master_857002_file is not None,
+    master_857003_file is not None
+])
 
-    with st.spinner("処理中..."):
-        try:
-            # マスタファイルの読み込み
-            st.info("📚 マスタファイル読み込み中...")
-            masters = load_master_files(master_857001_file, master_857002_file, master_857003_file)
+if total_files < 8:
+    st.warning(f"⚠️ {total_files}/8ファイルが認識されました。全8ファイル必要です。")
+else:
+    # 8ファイル揃ったら自動で処理（途中ログは出さない）
+    # 同じファイルセットで二重実行しない
+    sig_parts = [
+        getattr(shiire_file, "name", None),
+        getattr(ido_file, "name", None),
+        getattr(uri_file, "name", None),
+        getattr(tana_file, "name", None),
+        getattr(current_file, "name", None),
+        getattr(master_857001_file, "name", None),
+        getattr(master_857002_file, "name", None),
+        getattr(master_857003_file, "name", None),
+    ]
+    sig = tuple(sig_parts)
+    if "last_full_sig" not in st.session_state:
+        st.session_state.last_full_sig = None
 
-            # CSVファイルの読み込み（LF改行、Shift-JIS）
-            st.info("📂 在庫変動データ読み込み中...")
-            shiire_df = load_csv_with_encoding(shiire_file, use_lf=True, encoding='cp932')
-            ido_df = load_csv_with_encoding(ido_file, use_lf=True, encoding='cp932')
-            uri_df = load_csv_with_encoding(uri_file, use_lf=True, encoding='cp932')
-            if uri_df is None:
-                uri_df = pd.DataFrame()
-            tana_df = load_csv_with_encoding(tana_file, use_lf=True, encoding='cp932')
+    if st.session_state.last_full_sig != sig or st.session_state.processed_data is None:
+        st.session_state.last_full_sig = sig
+        progress_box = st.empty()
+        def _ui_progress(msg: str) -> None:
+            progress_box.info(msg)
 
-            # 現在庫ファイルの読み込み
-            st.info("📊 現在庫照会読み込み中...")
-            current_df = pd.read_excel(current_file)
-            st.success(f"✅ 現在庫照会: {len(current_df)}行")
-
-            # 仕入データ処理
-            st.info("🔄 仕入データ処理中...")
-            shiire_processed = process_shiire_data(shiire_df, masters)
-            shiire_individual = process_shiire_individual(shiire_processed)
-            shiire_accessory = process_shiire_accessory(shiire_processed)
-            st.success(f"✅ 仕入（個体）: {len(shiire_individual)}行、仕入（アクセサリ）: {len(shiire_accessory)}行")
-
-            # 移動データ処理
-            st.info("🔄 移動データ処理中...")
-            ido_processed = process_ido_data(ido_df, masters)
-            ido_shukko = process_ido_shukko(ido_processed)
-            ido_nyuko = process_ido_nyuko(ido_processed)
-            st.success(f"✅ 移動（出庫）: {len(ido_shukko)}行、移動（入庫）: {len(ido_nyuko)}行")
-
-            # 売上データ処理
-            st.info("🔄 売上データ処理中...")
-            # 1) main.py 相当の CSV レベルのチェックを先に実行（生データを検査）
-            try:
-                raw_bytes = uri_file.getvalue()
-                text = raw_bytes.decode('cp932')
-            except Exception:
-                text = None
-
-            if text:
-                try:
-                    err_flag, err_details, total_records, total_physical_lines, date_summary = check_and_analyze(text)
-                    if err_flag:
-                        st.error("❌ 売上ファイルに NG 条件が見つかりました。処理を中止します。")
-                        st.write(f"NG件数: {len(err_details)} 件")
-                        err_csv = build_error_csv_bytes(err_details)
-                        st.download_button("NG行一覧をダウンロード (UTF-8)", data=err_csv, file_name=f"{uri_file.name}_ng.csv")
-                        # 日付指摘もダウンロード可能
-                        ds_bytes = build_date_issue_csv_bytes(date_summary.issues)
-                        st.download_button("日付チェック指摘をダウンロード (UTF-8)", data=ds_bytes, file_name=f"{uri_file.name}_date_issues.csv")
-                        return
-                    else:
-                        # 日付チェックの警告などを表示（あれば）
-                        if date_summary.issues:
-                            st.warning(f"日付チェックで指摘があります（{len(date_summary.issues)} 件）。ダウンロードして確認してください。")
-                            ds_bytes = build_date_issue_csv_bytes(date_summary.issues)
-                            st.download_button("日付チェック指摘をダウンロード (UTF-8)", data=ds_bytes, file_name=f"{uri_file.name}_date_issues.csv")
-                except Exception as e:
-                    st.warning(f"売上ファイルの事前チェックで例外: {e}")
-
-            # 2) 既存の前処理: AG列削除とドコモショップ抽出
-            try:
-                before_rows = len(uri_df)
-                uri_df = drop_ag_column(uri_df)
-                kept_df, omitted_df = split_docomo_shop_rows(uri_df)
-                kept_rows = len(kept_df)
-                omitted_rows = len(omitted_df)
-                st.info(f"🔎 売上前処理: {before_rows}行 -> ドコモショップ抽出 {kept_rows}行 (除外 {omitted_rows}行)")
-                uri_df = kept_df
-            except Exception as e:
-                st.warning(f"売上前処理で注意: {e}")
-
-            uri_processed = process_uri_data(uri_df, masters)
-            uri_individual = process_uri_individual(uri_processed)
-            uri_sb_accessory = process_uri_sb_accessory(uri_processed)
-            uri_service = process_uri_service(uri_processed)
-            st.success(f"✅ 売上（個体）: {len(uri_individual)}行、売上（SBアクセサリ）: {len(uri_sb_accessory)}行、売上（サービス）: {len(uri_service)}行")
-
-            # 棚卸データ処理
-            st.info("🔄 棚卸データ処理中...")
-            tana_processed = process_tana_data(tana_df, masters)
-            tana_grouped = process_tana_grouped(tana_processed)
-            st.success(f"✅ 棚卸: {len(tana_grouped)}行")
-
-            # 全データ結合
-            st.info("🔗 データ結合・集計中...")
-            giniepos_hendo = combine_all_data(
-                shiire_individual, shiire_accessory,
-                ido_shukko, ido_nyuko,
-                uri_individual, uri_sb_accessory, uri_service,
-                tana_grouped
+        with st.spinner("解析中です（30〜60秒かかる場合があります）..."):
+            st.session_state.processed_data = run_full_check(
+                shiire_file, ido_file, uri_file, tana_file, current_file,
+                master_857001_file, master_857002_file, master_857003_file, progress_cb=_ui_progress
             )
-            st.success(f"✅ GINIEPOS変動数: {len(giniepos_hendo)}行")
+        st.success("処理が完了しました")
+        progress_box.empty()
 
-            # 現在庫との比較
-            st.info("🔍 在庫過不足チェック中...")
-            result_df = compare_with_current_inventory(giniepos_hendo, current_df)
-
-            # 結果をセッションステートに保存
-            st.session_state.processed_data = result_df
-
-            st.success("✅ 処理完了！")
-
-        except Exception as e:
-            st.error(f"❌ エラーが発生しました: {str(e)}")
-            st.exception(e)
-
-
-if 'last_full_sig' not in st.session_state:
-    st.session_state['last_full_sig'] = None
-
-if uploaded_files:
-    # decide files again and auto-run
-    for file in uploaded_files:
-        filename = file.name
-        if 'SHI' in filename.upper():
-            shiire_file = file
-        elif 'IDO' in filename.upper():
-            ido_file = file
-        elif 'URI' in filename.upper():
-            uri_file = file
-        elif 'TNA' in filename.upper():
-            tana_file = file
-        elif '現在庫' in filename or 'ZAIKO' in filename.upper():
-            current_file = file
-        elif '857001' in filename:
-            master_857001_file = file
-        elif '857002' in filename:
-            master_857002_file = file
-        elif '857003' in filename:
-            master_857003_file = file
-
-    total_files = sum([
-        shiire_file is not None,
-        ido_file is not None,
-        uri_file is not None,
-        tana_file is not None,
-        current_file is not None,
-        master_857001_file is not None,
-        master_857002_file is not None,
-        master_857003_file is not None
-    ])
-
-    if total_files < 8:
-        st.warning(f"⚠️ {total_files}/8ファイルが認識されました。全8ファイル必要です。")
-    else:
-        st.success("✅ 全8ファイルが揃いました！ 自動で処理を開始します...")
-        sig_parts = []
-        for f in uploaded_files:
-            try:
-                b = f.getvalue()
-                sig_parts.append((f.name, len(b), hashlib.sha256(b).hexdigest()))
-            except Exception:
-                sig_parts.append((f.name, None, None))
-        sig = tuple(sig_parts)
-        if st.session_state['last_full_sig'] != sig:
-            st.session_state['last_full_sig'] = sig
-            run_full_check(shiire_file, ido_file, uri_file, tana_file, current_file, master_857001_file, master_857002_file, master_857003_file)
-
-# 結果表示セクション
-if st.session_state.processed_data is not None and not st.session_state.processed_data.empty:
+# ----------------------------
+# 確認結果（3つのチェックを左→右で表示）
+# ----------------------------
+if st.session_state.processed_data:
     st.markdown("---")
-    st.header("2️⃣ 在庫不足結果")
-    result_df = st.session_state.processed_data
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("在庫不足件数", f"{len(result_df)}件")
-    with col2:
-        total_hendo = result_df['変動数'].sum()
-        st.metric("変動数合計", f"{total_hendo:,}")
-    with col3:
-        total_cl = result_df['CL実在庫数'].sum()
-        st.metric("CL実在庫合計", f"{int(total_cl):,}")
+    st.header("2️⃣ 確認結果")
 
-    display_cols = ['取次店コード', '取次店名', 'TMS商品CD', '変動数', 'CL実在庫数', '判定']
-    available_cols = [col for col in display_cols if col in result_df.columns]
-    st.subheader("📋 詳細リスト")
-    st.dataframe(result_df[available_cols].sort_values('判定'), use_container_width=True, height=400)
-    csv = result_df[available_cols].to_csv(index=False, encoding='cp932')
-    st.download_button(label="📥 結果をCSVでダウンロード", data=csv, file_name="在庫不足結果.csv", mime="text/csv", use_container_width=True)
-elif st.session_state.processed_data is not None:
-    st.success("✅ 在庫不足はありません！")
+    data = st.session_state.processed_data
 
-# フッター
-st.markdown("---")
-st.markdown("**在庫不足チェックシステム** | Python + Streamlit版 | Power Query完全準拠")
+    def _status_badge(status: str) -> str:
+        if status == "OK":
+            return "<span style='font-size:42px; font-weight:800; color:#1f7a1f;'>OK</span>"
+        if status == "NG":
+            return "<span style='font-size:42px; font-weight:800; color:#d11a2a;'>NG</span>"
+        return "<span style='font-size:42px; font-weight:800; color:#666;'>未実行</span>"
+
+    cols = st.columns(3)
+    for i, key in enumerate(["charge", "date", "inv"]):
+        with cols[i]:
+            st.markdown(f"**{data[key]['label']}**", unsafe_allow_html=True)
+            st.markdown(_status_badge(data[key]["status"]), unsafe_allow_html=True)
+            if data[key].get("message"):
+                st.caption(data[key]["message"])
+
+    # エラー詳細（NGのみ、表示順も左→右）
+    st.markdown("---")
+    any_ng = any(data[k]["status"] == "NG" for k in ["charge","date","inv"])
+    if any_ng:
+        st.subheader("📌 エラー詳細")
+        for key in ["charge","date","inv"]:
+            if data[key]["status"] != "NG":
+                continue
+            st.markdown(f"### {data[key]['label']}")
+            tbl = data[key].get("table")
+            if tbl is None:
+                st.write(data[key].get("message",""))
+                continue
+            if hasattr(tbl, "empty") and tbl.empty:
+                st.write("（該当なし）")
+                continue
+            st.dataframe(tbl, use_container_width=True, height=300)
+    else:
+        st.success("✅ すべてOKです")
