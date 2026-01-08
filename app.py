@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import io
@@ -12,24 +11,11 @@ from datetime import datetime, date
 from io import StringIO
 
 # ページ設定
-
-# ----------------------------
-# Constants (column names etc.)
-# ----------------------------
-COL_TONYA = '取次店コード'
-COL_SHOHIN = '商品コード'
-COL_TMS = 'TMS商品CD'
-COL_HOKAN = '保管場所CD'
-COL_JIGYO = '事業CD'
-COL_INV_BEFORE = '受払前在庫数'
-COL_INV_AFTER = '受払後在庫数'
-
 st.set_page_config(
     page_title="事前チェックシステム",
     page_icon="📦",
     layout="wide"
 )
-
 
 # --- Hide Streamlit default menu/footer/header (public-friendly) ---
 st.markdown(
@@ -49,6 +35,18 @@ st.markdown(
 
 st.title("🧪 事前チェックシステム")
 st.markdown("---")
+
+# ----------------------------
+# Constants (column names etc.)
+# ----------------------------
+COL_TONYA = '取次店コード'
+COL_SHOHIN = '商品コード'
+COL_TMS = 'TMS商品CD'
+COL_HOKAN = '保管場所CD'
+COL_JIGYO = '事業CD'
+COL_INV_BEFORE = '受払前在庫数'
+COL_INV_AFTER = '受払後在庫数'
+
 
 # ----------------------------
 # Utilities
@@ -71,6 +69,7 @@ if 'processed_data' not in st.session_state:
 # file_uploader reset key
 if 'uploader_version' not in st.session_state:
     st.session_state.uploader_version = 0
+
 
 def safe_rerun() -> None:
     """Rerun the Streamlit script in a way compatible with multiple Streamlit versions."""
@@ -99,6 +98,7 @@ def safe_rerun() -> None:
         except Exception:
             return
 
+
 def load_csv_with_encoding(file, use_lf=True, encoding='cp932') -> pd.DataFrame:
     """
     CSVファイルを読み込む（エンコーディングと改行コードを指定）
@@ -114,6 +114,7 @@ def load_csv_with_encoding(file, use_lf=True, encoding='cp932') -> pd.DataFrame:
     except Exception as e:
         st.error(f"CSVファイルの読み込みエラー: {str(e)}")
         return None
+
 
 def load_master_files(master_857001, master_857002, master_857003, master_13000=None) -> Dict[str, pd.DataFrame]:  # NOSONAR
     """
@@ -200,7 +201,6 @@ def load_master_files(master_857001, master_857002, master_857003, master_13000=
             df = normalize_columns(df)
             masters["857003"] = df
 
-
     # 13000（商品構成マスタ：パック商品CD→内訳商品CD）
     if master_13000:
         df = load_csv_with_encoding(master_13000, use_lf=False, encoding="utf-8-sig")
@@ -215,6 +215,8 @@ def load_master_files(master_857001, master_857002, master_857003, master_13000=
             masters["13000"] = df
 
     return masters
+
+
 def drop_ag_column(df: pd.DataFrame) -> pd.DataFrame:
     """
     ExcelのAG列 = 33列目（1-based）= index 32（0-based）
@@ -225,11 +227,13 @@ def drop_ag_column(df: pd.DataFrame) -> pd.DataFrame:
         return df
     return df.drop(df.columns[ag_index], axis=1)
 
+
 def normalize_text(s: str) -> str:
     """半角・全角の揺れを吸収するために正規化する（NFKC）"""
     return unicodedata.normalize("NFKC", s)
 
-def split_docomo_shop_rows(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+
+def split_docomo_shop_rows(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     D列（4列目）に「ドコモショップ（半角全角問わず）」を含む行を残し、
     それ以外を omit（除外）として分離する。
@@ -251,6 +255,7 @@ def split_docomo_shop_rows(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame
     omitted_df = df[~mask].copy()
     return kept_df, omitted_df
 
+
 # --- main.py のチェック機能取り込み ---
 TARGET_COL_25 = 24
 TARGET_COL_38 = 37
@@ -258,12 +263,14 @@ DATE_COL_9 = 8
 DATE_COL_17 = 16
 DATE_TIME_RE = re.compile(r"^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}$")
 
+
 @dataclass
 class ErrorDetail:
     row: int
     store_name: str
     slip_number: str
     col_38: str
+
 
 @dataclass
 class DateIssue:
@@ -275,6 +282,7 @@ class DateIssue:
     col17: str
     note: str
 
+
 @dataclass
 class DateSummary:
     total_checked_cells: int
@@ -282,9 +290,9 @@ class DateSummary:
     count_error: int
     issues: List[DateIssue]
 
+
 def csv_reader_from_text(csv_text: str):
     return csv.reader(StringIO(csv_text, newline=""))
-
 
 
 def load_csv_from_text(csv_text: str) -> pd.DataFrame:
@@ -292,6 +300,7 @@ def load_csv_from_text(csv_text: str) -> pd.DataFrame:
     Keep all columns as strings to avoid dtype surprises.
     """
     return pd.read_csv(StringIO(csv_text), dtype=str, keep_default_na=False)
+
 
 def load_current_inventory_excel(uploaded_file) -> pd.DataFrame:
     """現在庫照会（商品別）ExcelをDataFrameとして読み込む。
@@ -324,7 +333,6 @@ def load_current_inventory_excel(uploaded_file) -> pd.DataFrame:
     return df
 
 
-
 def parse_dt_str(s: str) -> Optional[datetime]:
     t = s.strip()
     if not DATE_TIME_RE.match(t):
@@ -334,6 +342,7 @@ def parse_dt_str(s: str) -> Optional[datetime]:
     except Exception:
         return None
 
+
 def build_error_csv_bytes(details: List[ErrorDetail]) -> bytes:
     buf = StringIO()
     w = csv.writer(buf, lineterminator="\n")
@@ -342,6 +351,7 @@ def build_error_csv_bytes(details: List[ErrorDetail]) -> bytes:
         w.writerow([d.row, d.store_name, d.slip_number, d.col_38])
     return buf.getvalue().encode("utf-8")
 
+
 def build_date_issue_csv_bytes(issues: List[DateIssue]) -> bytes:
     buf = StringIO()
     w = csv.writer(buf, lineterminator="\n")
@@ -349,6 +359,7 @@ def build_date_issue_csv_bytes(issues: List[DateIssue]) -> bytes:
     for it in issues:
         w.writerow([it.record_no, it.start_physical_line, it.severity, it.issue_type, it.col9, it.col17, it.note])
     return buf.getvalue().encode("utf-8")
+
 
 def check_and_analyze(csv_text: str) -> Tuple[bool, List[ErrorDetail], int, int, DateSummary]:  # NOSONAR
     """
@@ -415,7 +426,9 @@ def check_and_analyze(csv_text: str) -> Tuple[bool, List[ErrorDetail], int, int,
     )
     return (len(error_details) > 0), error_details, total_data_records, total_physical_lines, date_summary
 
+
 ### --- 取り込みここまで ---
+
 
 def process_shiire_data(df: pd.DataFrame, masters: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     """
@@ -454,6 +467,7 @@ def process_shiire_data(df: pd.DataFrame, masters: Dict[str, pd.DataFrame]) -> p
         df = df[~df['商品コード'].str.contains(code, na=False)]
     return df
 
+
 def process_shiire_individual(df: pd.DataFrame) -> pd.DataFrame:
     """仕入データ（個体情報）"""
     # ← 最小修正：OR を追加（いずれかが非空なら対象）
@@ -474,6 +488,7 @@ def process_shiire_individual(df: pd.DataFrame) -> pd.DataFrame:
     result = result.rename(columns={'数量': '変動数'})
     return result
 
+
 def process_shiire_accessory(df: pd.DataFrame) -> pd.DataFrame:
     """仕入データ（アクセサリ）"""
     # IMEI、ICCID、その他シリアル全てが空
@@ -491,6 +506,7 @@ def process_shiire_accessory(df: pd.DataFrame) -> pd.DataFrame:
     )['数量'].sum().reset_index()
     result = result.rename(columns={'数量': '変動数'})
     return result
+
 
 def process_ido_data(df: pd.DataFrame, masters: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     """
@@ -543,6 +559,7 @@ def process_ido_data(df: pd.DataFrame, masters: Dict[str, pd.DataFrame]) -> pd.D
         df['TMS商品CD'] = df['商品コード']
     return df
 
+
 def process_ido_shukko(df: pd.DataFrame) -> pd.DataFrame:
     """移動データ（出庫）"""
     # カテゴリ中がＵＳＩＭカードでない
@@ -565,6 +582,7 @@ def process_ido_shukko(df: pd.DataFrame) -> pd.DataFrame:
     result = result[result['保管場所CD'] != '']
     return result
 
+
 def process_ido_nyuko(df: pd.DataFrame) -> pd.DataFrame:
     """移動データ（入庫）"""
     # カテゴリ中がＵＳＩＭカードでない
@@ -586,6 +604,7 @@ def process_ido_nyuko(df: pd.DataFrame) -> pd.DataFrame:
     # 保管場所CDが空でない
     result = result[result['保管場所CD'] != '']
     return result
+
 
 def process_uri_data(df: pd.DataFrame, masters: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     """
@@ -620,6 +639,7 @@ def process_uri_data(df: pd.DataFrame, masters: Dict[str, pd.DataFrame]) -> pd.D
     df['数量'] = df['収納種別'].apply(lambda x: -1 if x == '販売' else 1)
     return df
 
+
 def process_uri_individual(df: pd.DataFrame) -> pd.DataFrame:
     """売上データ（個体情報）"""
     # 必要な列が無い場合は空文字列列を作成（入力データによっては列名が存在しないことがある）
@@ -651,6 +671,7 @@ def process_uri_individual(df: pd.DataFrame) -> pd.DataFrame:
     result = result.rename(columns={'数量': '変動数'})
     return result
 
+
 def process_uri_sb_accessory(df: pd.DataFrame) -> pd.DataFrame:
     """売上データ（SBアクセサリ）"""
     # 必要な列が無い場合は空文字列列を作成
@@ -680,6 +701,7 @@ def process_uri_sb_accessory(df: pd.DataFrame) -> pd.DataFrame:
     result = result.rename(columns={'数量': '変動数'})
     return result
 
+
 def process_uri_service(df: pd.DataFrame) -> pd.DataFrame:
     """売上データ（サービス）"""
     # 必要な列が無い場合は空文字列列を作成
@@ -703,6 +725,7 @@ def process_uri_service(df: pd.DataFrame) -> pd.DataFrame:
     )['数量'].sum().reset_index()
     result = result.rename(columns={'数量': '変動数'})
     return result
+
 
 def process_tana_data(df: pd.DataFrame, masters: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     """
@@ -738,6 +761,7 @@ def process_tana_data(df: pd.DataFrame, masters: Dict[str, pd.DataFrame]) -> pd.
         df = df[~df['商品コード'].str.contains(code, na=False)]
     return df
 
+
 def process_tana_grouped(df: pd.DataFrame) -> pd.DataFrame:
     """棚卸データ（グループ化）"""
     # カテゴリ中がＵＳＩＭカードでない
@@ -749,6 +773,7 @@ def process_tana_grouped(df: pd.DataFrame) -> pd.DataFrame:
     )['数量'].sum().reset_index()
     result = result.rename(columns={'数量': '変動数'})
     return result
+
 
 def combine_all_data(shiire_ind, shiire_acc, ido_shukko, ido_nyuko,
                      uri_ind, uri_sb, uri_service, tana_grouped) -> pd.DataFrame:
@@ -772,11 +797,22 @@ def combine_all_data(shiire_ind, shiire_acc, ido_shukko, ido_nyuko,
     result = result.sort_values('取次店コード').reset_index(drop=True)
     return result
 
-def compare_with_current_inventory(giniepos_df: pd.DataFrame, current_df: pd.DataFrame) -> pd.DataFrame:
+
+def compare_with_current_inventory(
+    giniepos_df: pd.DataFrame,
+    current_df: pd.DataFrame,
+    master_857003: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
     """
     GINIEPOS変動数と現在庫照会を比較（判定結果）
-    - PowerQuery準拠で、キー列はTRIM相当（前後空白/全角空白除去）して突合ズレを防ぐ
-    - 現在庫の実在庫数量（文字の場合あり）を数値化して判定に使用する
+
+    - キー: 事業CD × 保管場所CD × TMS商品CD
+    - 在庫不足:
+        現在庫が存在し、変動数 + 在庫 < 0
+    - 突合不可:
+        「現在庫にない」かつ「857003（事業CD×TMS商品CD）にも載っていない」
+        ただし TMS商品CD が Z00014 / POS- を含むものは突合不可除外
+    - 最終結果からは Z00014 / POS- を除外（既存仕様踏襲）
     """
     if giniepos_df is None or giniepos_df.empty or current_df is None or current_df.empty:
         return pd.DataFrame()
@@ -785,18 +821,19 @@ def compare_with_current_inventory(giniepos_df: pd.DataFrame, current_df: pd.Dat
     required_cols = ['保管場所CD', '事業CD', '商品CD', '実在庫数量']
     missing = [c for c in required_cols if c not in current_df.columns]
     if missing:
-        raise KeyError(f"現在庫照会ファイルに必要な列が見つかりません: {missing} / 実列={list(current_df.columns)}")
+        raise KeyError(
+            f"現在庫照会ファイルに必要な列が見つかりません: {missing} / 実列={list(current_df.columns)}"
+        )
 
     current_summary = current_df[required_cols].copy()
 
-    # ---- キー列の正規化（PowerQueryのTrim相当） ----
+    # ---- キー列の正規化（PowerQueryのTrim相当）----
     for c in ['事業CD', '保管場所CD', '商品CD']:
         current_summary[c] = normalize_key_series(current_summary[c])
     for c in ['事業CD', '保管場所CD', 'TMS商品CD']:
         giniepos_df[c] = normalize_key_series(giniepos_df[c])
 
     # ---- 在庫数量の数値化（文字→数値） ----
-    # カンマ区切り/空白混入を許容
     current_summary['CL実在庫数'] = (
         current_summary['実在庫数量']
         .astype(str)
@@ -804,42 +841,92 @@ def compare_with_current_inventory(giniepos_df: pd.DataFrame, current_df: pd.Dat
         .str.replace('　', ' ', regex=False)
         .str.strip()
     )
-    current_summary['CL実在庫数'] = pd.to_numeric(current_summary['CL実在庫数'], errors='coerce').fillna(0)
+    current_summary['CL実在庫数'] = pd.to_numeric(
+        current_summary['CL実在庫数'], errors='coerce'
+    )
 
-    
     # マージ（Left Outer Join）
     result = giniepos_df.merge(
         current_summary[['保管場所CD', '事業CD', '商品CD', 'CL実在庫数']],
         left_on=['保管場所CD', '事業CD', 'TMS商品CD'],
         right_on=['保管場所CD', '事業CD', '商品CD'],
-        how='left'
+        how='left',
     )
 
+    # ---- 857003（事業CD×TMS商品CD）存在チェック ----
+    # デフォルトは「存在しない」としておき、857003があれば上書き
+    exist_in_857003 = pd.Series(False, index=result.index)
+
+    if master_857003 is not None and not master_857003.empty:
+        m857 = master_857003.copy()
+
+        # PowerQuery情報に合わせた列候補
+        jigyo_candidates = ['事業CD', '変換前コード値02']
+        tms_candidates = ['TMS商品CD', '変換前コード値01']
+
+        jigyo_col = next((c for c in jigyo_candidates if c in m857.columns), None)
+        tms_col = next((c for c in tms_candidates if c in m857.columns), None)
+
+        if jigyo_col is not None and tms_col is not None:
+            key_df = m857[[jigyo_col, tms_col]].copy()
+            key_df.columns = ['事業CD', 'TMS商品CD']
+
+            key_df['事業CD'] = normalize_key_series(key_df['事業CD'])
+            key_df['TMS商品CD'] = normalize_key_series(key_df['TMS商品CD'])
+            key_df = key_df.drop_duplicates()
+
+            key_set = set(
+                (str(j), str(t))
+                for j, t in zip(key_df['事業CD'], key_df['TMS商品CD'])
+            )
+
+            res_jigyo = normalize_key_series(result['事業CD'])
+            res_tms = normalize_key_series(result['TMS商品CD'])
+            res_keys = list(zip(res_jigyo.astype(str), res_tms.astype(str)))
+
+            exist_in_857003 = pd.Series(
+                [(k in key_set) for k in res_keys],
+                index=result.index,
+            )
+        # 列が見つからない場合は、そのまま「すべて存在しない扱い」
+
     # ---- 突合不可の扱い ----
-    # 現在庫が見つからない行は「在庫0」ではなく「突合不可」として分離する（マスタ不備等の誤判定防止）
-    unmatched = result['CL実在庫数'].isna()
+    # 現在庫が見つからない行は unmatched_current として扱う
+    unmatched_current = result['CL実在庫数'].isna()
 
     # 判定（変動数 + 実在庫）は、現在庫が見つかった行のみ計算
     result['判定'] = pd.NA
-    result.loc[~unmatched, '判定'] = result.loc[~unmatched, '変動数'] + result.loc[~unmatched, 'CL実在庫数']
+    result.loc[~unmatched_current, '判定'] = (
+        result.loc[~unmatched_current, '変動数'] + result.loc[~unmatched_current, 'CL実在庫数']
+    )
 
     # 判定区分
     result['判定区分'] = 'OK'
-    result.loc[unmatched, '判定区分'] = '突合不可'
-    result.loc[(~unmatched) & (result['判定'] < 0), '判定区分'] = '在庫不足'
+    # 在庫不足（既存仕様維持）
+    result.loc[(~unmatched_current) & (result['判定'] < 0), '判定区分'] = '在庫不足'
+
+    # TMS商品CDが Z00014 / POS- を含むもの（突合不可除外対象）
+    tms_series = result['TMS商品CD'].astype(str)
+    exclude_for_unmatch = tms_series.str.contains('Z00014', na=False) | tms_series.str.contains('POS-', na=False)
+
+    # 新しい「突合不可」条件:
+    #   現在庫にない かつ 857003にもない かつ Z00014/POS- を含まない
+    result.loc[
+        unmatched_current & (~exist_in_857003) & (~exclude_for_unmatch),
+        '判定区分'
+    ] = '突合不可'
 
     # 除外（PowerQuery準拠）
     result = result[~result['TMS商品CD'].str.contains('BB-RQ8POU1740', na=False)]
     result = result[~result['TMS商品CD'].str.contains('ZUA292', na=False)]
 
-    # さらに除外
+    # さらに除外（最終結果から Z00014 / POS- を除外：既存仕様踏襲）
     result = result[~result['TMS商品CD'].str.contains('Z00014', na=False)]
     result = result[~result['TMS商品CD'].str.contains('POS-', na=False)]
 
     # 返却は「在庫不足」または「突合不可」のみ（OKは表示しない）
     result = result[result['判定区分'].isin(['在庫不足', '突合不可'])]
     return result
-
 
 
 def _decode_upload_text(upload_file) -> str:
@@ -863,7 +950,7 @@ def _build_date_issue_df(date_summary: DateSummary) -> pd.DataFrame:
     return pd.DataFrame([{
         "レコード番号": it.record_no,
         "開始行(物理行)": it.start_physical_line,
-        "終了行(物理行)": it.end_physical_line,
+        "終了行(物理行)": it.start_physical_line,  # 旧ロジック互換（終了行は開始行と同じ扱い）
         "9列目の値": it.col9,
         "補足": it.note
     } for it in date_summary.issues])
@@ -937,7 +1024,7 @@ def _run_inventory_check(
         tana_grouped
     )
 
-    return compare_with_current_inventory(merged_hendo, current_df)
+    return compare_with_current_inventory(merged_hendo, current_df, masters.get("857003"))
 
 
 def run_full_check(
@@ -948,7 +1035,12 @@ def run_full_check(
     result = {
         "charge": {"label": "チャージ金額チェック", "status": "未実行", "table": None, "message": ""},
         "date":   {"label": "売上日付チェック",     "status": "未実行", "table": None, "message": ""},
-        "inv":    {"label": "在庫不足チェック",     "status": "未実行", "table": None, "message": ""},
+        "inv":    {
+            "label": "在庫不足チェック",
+            "status": "未実行",
+            "table": None,
+            "message": "",
+        },
     }
 
     def _progress(msg: str) -> None:
@@ -981,7 +1073,6 @@ def run_full_check(
             master_857001_file, master_857002_file, master_857003_file, master_13000_file
         )
 
-        
         if inv_result is not None and not inv_result.empty:
             result["inv"]["status"] = "NG"
             # 件数内訳（在庫不足 / 突合不可）
@@ -997,7 +1088,6 @@ def run_full_check(
             result["inv"]["table"] = inv_result
             result["inv"]["message"] = "OK"
 
-
     except KeyError as e:
         # 必須列不足など：判定NGではなく「処理エラー」と明示（社内公開向け）
         result["inv"]["status"] = "NG"
@@ -1010,6 +1100,7 @@ def run_full_check(
         result["inv"]["message"] = f"在庫不足チェック（処理エラー）: {e}"
 
     return result
+
 
 # ファイルアップロードセクション
 st.markdown("""
@@ -1035,6 +1126,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.info('9ファイルの解析は、PCの負荷やファイルサイズによって30〜60秒以上かかる場合があります。反応が遅くても少し待ってください。')
+
 # file_uploader を広くする（落としやすくする）
 st.markdown(
     """
@@ -1076,8 +1168,7 @@ uploaded_files = st.file_uploader(
     key=f"uploader_{st.session_state.uploader_version}"
 )
 
-
-# クリア（結果だけ消して初期状態に戻す）
+# クリア（結果だけ消して初期状態を戻す）
 if st.button("🔄 クリア", key="clear_btn", help="結果とアップロード状態をクリアして初期表示に戻します"):
     st.session_state.processed_data = None
     st.session_state.last_full_sig = None
@@ -1093,7 +1184,6 @@ current_file = None
 master_857001_file = None
 master_857002_file = None
 master_857003_file = None
-
 master_13000_file = None
 
 if uploaded_files:
@@ -1101,36 +1191,24 @@ if uploaded_files:
         filename = file.name
         if 'SHI' in filename.upper():
             shiire_file = file
-
         elif 'IDO' in filename.upper():
             ido_file = file
-
         elif 'URI' in filename.upper():
             uri_file = file
-
         elif 'TNA' in filename.upper():
             tana_file = file
-
         elif '現在庫' in filename or 'ZAIKO' in filename.upper():
             current_file = file
-
         elif '857001' in filename:
             master_857001_file = file
-
         elif '857002' in filename:
             master_857002_file = file
-
         elif '857003' in filename:
             master_857003_file = file
-
         elif '13000' in filename:
             master_13000_file = file
-
         else:
             st.warning(f"⚠️ 不明なファイル: {filename}")
-
-    # ファイル数チェック
-
 
 # 必要ファイル数チェック
 total_files = sum([
@@ -1167,13 +1245,15 @@ else:
     if st.session_state.last_full_sig != sig or st.session_state.processed_data is None:
         st.session_state.last_full_sig = sig
         progress_box = st.empty()
+
         def _ui_progress(msg: str) -> None:
             progress_box.info(msg)
 
         with st.spinner("解析中です（30〜60秒かかる場合があります）..."):
             st.session_state.processed_data = run_full_check(
                 shiire_file, ido_file, uri_file, tana_file, current_file,
-                master_857001_file, master_857002_file, master_857003_file, master_13000_file, progress_cb=_ui_progress
+                master_857001_file, master_857002_file, master_857003_file, master_13000_file,
+                progress_cb=_ui_progress
             )
         st.success("処理が完了しました")
         progress_box.empty()
@@ -1204,16 +1284,16 @@ if st.session_state.processed_data:
 
     # エラー詳細（NGのみ、表示順も左→右）
     st.markdown("---")
-    any_ng = any(data[k]["status"] == "NG" for k in ["charge","date","inv"])
+    any_ng = any(data[k]["status"] == "NG" for k in ["charge", "date", "inv"])
     if any_ng:
         st.subheader("📌 エラー詳細")
-        for key in ["charge","date","inv"]:
+        for key in ["charge", "date", "inv"]:
             if data[key]["status"] != "NG":
                 continue
             st.markdown(f"### {data[key]['label']}")
             tbl = data[key].get("table")
             if tbl is None:
-                st.write(data[key].get("message",""))
+                st.write(data[key].get("message", ""))
                 continue
             if hasattr(tbl, "empty") and tbl.empty:
                 st.write("（該当なし）")
