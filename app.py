@@ -434,12 +434,19 @@ def process_shiire_data(df: pd.DataFrame, masters: Dict[str, pd.DataFrame]) -> p
     """
     仕入データの完全処理（Power Query準拠）
     """
-    if df is None or df.empty:
+    # ★修正前
+    # if df is None or df.empty:
+    #     return pd.DataFrame()
+
+    # ★修正後
+    if df is None:
         return pd.DataFrame()
+
     # 型変換
     df['受払前在庫数'] = pd.to_numeric(df['受払前在庫数'], errors='coerce').fillna(0).astype(int)
     df['数量'] = pd.to_numeric(df['数量'], errors='coerce').fillna(0).astype(int)
     df['受払後在庫数'] = pd.to_numeric(df['受払後在庫数'], errors='coerce').fillna(0).astype(int)
+    # （以下は既存のまま）
     # マスタ857001とマージ（Inner Join）
     if '857001' in masters:
         df = df.merge(masters['857001'], on='取次店コード', how='inner')
@@ -512,11 +519,18 @@ def process_ido_data(df: pd.DataFrame, masters: Dict[str, pd.DataFrame]) -> pd.D
     """
     移動データの完全処理（Power Query準拠）
     """
-    if df is None or df.empty:
+    # ★修正前
+    # if df is None or df.empty:
+    #     return pd.DataFrame()
+
+    # ★修正後
+    if df is None:
         return pd.DataFrame()
+
     # 型変換
     df['入庫予定数'] = pd.to_numeric(df['入庫予定数'], errors='coerce').fillna(0).astype(int)
     df['未入庫数'] = pd.to_numeric(df['未入庫数'], errors='coerce').fillna(0).astype(int)
+    # （以下は既存のまま）
     # 不要な列を削除（空の列）
     df = df.loc[:, ~df.columns.str.startswith('_')]
     df = df.loc[:, df.columns != '']
@@ -610,11 +624,18 @@ def process_uri_data(df: pd.DataFrame, masters: Dict[str, pd.DataFrame]) -> pd.D
     """
     売上データの完全処理（Power Query準拠）
     """
-    if df is None or df.empty:
+    # ★修正前
+    # if df is None or df.empty:
+    #     return pd.DataFrame()
+
+    # ★修正後
+    if df is None:
         return pd.DataFrame()
+
     # マスタ857001とマージ（Left Outer Join）
     if '857001' in masters:
         df = df.merge(masters['857001'], on='取次店コード', how='left')
+    # （以下は既存のまま）
     # 商品構成マスタ_13000（パック商品CD→内訳商品CD）で展開（PowerQuery準拠）
     # - 商品コードがパック商品CDに該当する場合、内訳商品CDに置き換える（行は内訳数だけ増える）
     if '13000' in masters:
@@ -731,8 +752,14 @@ def process_tana_data(df: pd.DataFrame, masters: Dict[str, pd.DataFrame]) -> pd.
     """
     棚卸データの完全処理（Power Query準拠）
     """
-    if df is None or df.empty:
+    # ★修正前
+    # if df is None or df.empty:
+    #     return pd.DataFrame()
+
+    # ★修正後
+    if df is None:
         return pd.DataFrame()
+
     # マスタ857001とマージ（Inner Join）
     if '857001' in masters:
         df = df.merge(masters['857001'], on='取次店コード', how='inner')
@@ -740,6 +767,7 @@ def process_tana_data(df: pd.DataFrame, masters: Dict[str, pd.DataFrame]) -> pd.
     df['受払前在庫数'] = pd.to_numeric(df['受払前在庫数'], errors='coerce').fillna(0).astype(int)
     df['数量'] = pd.to_numeric(df['数量'], errors='coerce').fillna(0).astype(int)
     df['受払後在庫数'] = pd.to_numeric(df['受払後在庫数'], errors='coerce').fillna(0).astype(int)
+    # （以下は既存のまま）
     # 不要な列を削除
     df = df.loc[:, ~df.columns.str.startswith('_')]
     df = df.loc[:, df.columns != '']
