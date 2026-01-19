@@ -832,20 +832,13 @@ def compare_with_current_inventory(
     master_857003: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
-    GINIEPOS変動数と現在庫照会を比較（判定結果）
-
-    - キー: 事業CD × 保管場所CD × TMS商品CD
-    - 在庫不足:
-        現在庫が存在し、変動数 + 在庫 < 0
-    - 突合不可:
-        「現在庫にない」かつ「857003（事業CD×TMS商品CD）にも載っていない」
-        ただし TMS商品CD が Z00014 / POS- を含むものは突合不可除外
-    - 最終結果からは Z00014 / POS- を除外（既存仕様踏襲）
+    GINIEPOS変動数と現在庫照会を比較して
+    ・在庫不足
+    ・突合不可
+    を判定して返す
     """
-    if giniepos_df is None or giniepos_df.empty or current_df is None or current_df.empty:
-        return pd.DataFrame()
 
-    # 現在庫照会から必要な列のみ取得
+    # ---- 現在庫照会から必要な列のみ取得 ----
     required_cols = ['保管場所CD', '事業CD', '商品CD', '実在庫数量']
     missing = [c for c in required_cols if c not in current_df.columns]
     if missing:
@@ -855,13 +848,13 @@ def compare_with_current_inventory(
 
     current_summary = current_df[required_cols].copy()
 
-    # ---- キー列の正規化（PowerQueryのTrim相当）----
+    # ---- キー列の正規化（PowerQuery の Trim 相当）----
     for c in ['事業CD', '保管場所CD', '商品CD']:
         current_summary[c] = normalize_key_series(current_summary[c])
     for c in ['事業CD', '保管場所CD', 'TMS商品CD']:
         giniepos_df[c] = normalize_key_series(giniepos_df[c])
 
-    # ---- 在庫数量の数値化（文字→数値） ----
+    # ---- 在庫数量の文字→数値化 ----
     current_summary['CL実在庫数'] = (
         current_summary['実在庫数量']
         .astype(str)
@@ -871,9 +864,9 @@ def compare_with_current_inventory(
     )
     current_summary['CL実在庫数'] = pd.to_numeric(
         current_summary['CL実在庫数'], errors='coerce'
-    )
+    ).fillna(0)
 
-    # マージ（Left Outer Join）
+    # ---- マージ（Left Outer Join）----
     result = giniepos_df.merge(
         current_summary[['保管場所CD', '事業CD', '商品CD', 'CL実在庫数']],
         left_on=['保管場所CD', '事業CD', 'TMS商品CD'],
@@ -881,14 +874,21 @@ def compare_with_current_inventory(
         how='left',
     )
 
+    # 「現在庫に行が存在するかどうか」は商品CDの有無で判定
+    unmatched_current = result['商品CD'].isna()
+
+    # CL実在庫数はここでもう一度数値化して、無いところは 0 として扱う
+    result['CL実在庫数'] = pd.to_numeric(
+        result['CL実在庫数'], errors='coerce'
+    ).fillna(0)
+
+
     # ---- 857003（事業CD×TMS商品CD）存在チェック ----
-    # デフォルトは「存在しない」としておき、857003があれば上書き
     exist_in_857003 = pd.Series(False, index=result.index)
 
     if master_857003 is not None and not master_857003.empty:
         m857 = master_857003.copy()
 
-        # PowerQuery情報に合わせた列候補
         jigyo_candidates = ['事業CD', '変換前コード値02']
         tms_candidates = ['TMS商品CD', '変換前コード値01']
 
@@ -916,35 +916,35 @@ def compare_with_current_inventory(
                 [(k in key_set) for k in res_keys],
                 index=result.index,
             )
-        # 列が見つからない場合は、そのまま「すべて存在しない扱い」
 
-    # ---- 突合不可の扱い ----
-    # 現在庫が見つからない行は unmatched_current として扱う
-    unmatched_current = result['CL実在庫数'].isna()
+    # ---- 判定（変動数 + 在庫）を全行で計算 ----
+    result['判定'] = result['変動数'] + result['CL実在庫数']
 
-    # 判定（変動数 + 実在庫）は、現在庫が見つかった行のみ計算
-    result['判定'] = pd.NA
-    result.loc[~unmatched_current, '判定'] = (
-        result.loc[~unmatched_current, '変動数'] + result.loc[~unmatched_current, 'CL実在庫数']
+    # 判定区分初期値は OK
+    result['判定区分'] = 'OK'
+
+    # 在庫不足：現在庫の有無に関係なく、合計がマイナスなら在庫不足
+    result.loc[result['判定'] < 0, '判定区分'] = '在庫不足'
+
+    # TMS商品CD が Z00014 / POS- を含むもの（突合不可除外対象）
+    tms_series = result['TMS商品CD'].astype(str)
+    exclude_for_unmatch = (
+        tms_series.str.contains('Z00014', na=False) |
+        tms_series.str.contains('POS-', na=False)
     )
 
-    # 判定区分
-    result['判定区分'] = 'OK'
-    # 在庫不足（既存仕様維持）
-    result.loc[(~unmatched_current) & (result['判定'] < 0), '判定区分'] = '在庫不足'
-
-    # TMS商品CDが Z00014 / POS- を含むもの（突合不可除外対象）
-    tms_series = result['TMS商品CD'].astype(str)
-    exclude_for_unmatch = tms_series.str.contains('Z00014', na=False) | tms_series.str.contains('POS-', na=False)
-
     # 新しい「突合不可」条件:
-    #   現在庫にない かつ 857003にもない かつ Z00014/POS- を含まない
+    #   現在庫にない かつ 857003 にもない かつ Z00014/POS- を含まない
+    #   かつ すでに在庫不足と判定されていない行
     result.loc[
-        unmatched_current & (~exist_in_857003) & (~exclude_for_unmatch),
+        unmatched_current &
+        (~exist_in_857003) &
+        (~exclude_for_unmatch) &
+        (result['判定区分'] != '在庫不足'),
         '判定区分'
     ] = '突合不可'
 
-    # 除外（PowerQuery準拠）
+    # 除外（PowerQuery 準拠）
     result = result[~result['TMS商品CD'].str.contains('BB-RQ8POU1740', na=False)]
     result = result[~result['TMS商品CD'].str.contains('ZUA292', na=False)]
 
@@ -952,10 +952,10 @@ def compare_with_current_inventory(
     result = result[~result['TMS商品CD'].str.contains('Z00014', na=False)]
     result = result[~result['TMS商品CD'].str.contains('POS-', na=False)]
 
-    # 返却は「在庫不足」または「突合不可」のみ（OKは表示しない）
+    # 返却は「在庫不足」または「突合不可」のみ（OK は返さない）
     result = result[result['判定区分'].isin(['在庫不足', '突合不可'])]
-    return result
 
+    return result
 
 def _decode_upload_text(upload_file) -> str:
     data = upload_file.getvalue()
@@ -1051,15 +1051,14 @@ def _run_inventory_check(
         uri_individual, uri_sb, uri_service,
         tana_grouped
     )
-
     return compare_with_current_inventory(merged_hendo, current_df, masters.get("857003"))
 
 
 def run_full_check(
-    shiire_file, ido_file, uri_file, tana_file, current_file,
-    master_857001_file, master_857002_file, master_857003_file, master_13000_file,
-    progress_cb=None
-):
+        shiire_file, ido_file, uri_file, tana_file, current_file,
+        master_857001_file, master_857002_file, master_857003_file, master_13000_file,
+        progress_cb=None
+    ):
     result = {
         "charge": {"label": "チャージ金額チェック", "status": "未実行", "table": None, "message": ""},
         "date":   {"label": "売上日付チェック",     "status": "未実行", "table": None, "message": ""},
@@ -1326,6 +1325,6 @@ if st.session_state.processed_data:
             if hasattr(tbl, "empty") and tbl.empty:
                 st.write("（該当なし）")
                 continue
-            st.dataframe(tbl, use_container_width=True, height=300)
+            st.dataframe(tbl, width='stretch', height=300)
     else:
         st.success("✅ すべてOKです")
