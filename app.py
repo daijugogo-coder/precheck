@@ -1051,7 +1051,54 @@ def _run_inventory_check(
         uri_individual, uri_sb, uri_service,
         tana_grouped
     )
-    return compare_with_current_inventory(merged_hendo, current_df, masters.get("857003"))
+
+    # まずは通常どおり在庫不足／突合不可判定を実行
+    inv_result = compare_with_current_inventory(
+        merged_hendo, current_df, masters.get("857003")
+    )
+
+    # --- ここが今回の追加ロジック ---
+    # 最下流の段階で「倉庫（コード値1=2）」を在庫不足チェック対象から除外する
+    if inv_result is not None and not inv_result.empty:
+        m857001 = masters.get("857001")
+        if (
+            m857001 is not None
+            and not m857001.empty
+            and "取次店コード" in m857001.columns
+        ):
+            # 857001側：取次店コード＋店舗倉庫区分だけ使う
+            m857 = m857001[["取次店コード", "店舗倉庫区分"]].copy()
+            m857["取次店コード"] = normalize_key_series(m857["取次店コード"])
+
+            # 在庫不足結果側にも正規化キーを持たせて結合
+            if "取次店コード" in inv_result.columns:
+                inv = inv_result.copy()
+                inv["取次店コード_norm"] = normalize_key_series(inv["取次店コード"])
+
+                inv = inv.merge(
+                    m857,
+                    left_on="取次店コード_norm",
+                    right_on="取次店コード",
+                    how="left",
+                    suffixes=("", "_m857")
+                )
+
+                # 店舗倉庫区分 = '2'（倉庫） かつ 判定区分 = '在庫不足' を除外
+                mask_warehouse_shortage = (
+                    (inv.get("判定区分") == "在庫不足") &
+                    (inv.get("店舗倉庫区分") == "2")
+                )
+                inv = inv[~mask_warehouse_shortage]
+
+                # 補助列を削除（画面側には出さない）
+                inv = inv.drop(
+                    columns=["取次店コード_norm", "取次店コード_m857"],
+                    errors="ignore"
+                )
+
+                inv_result = inv
+
+    return inv_result
 
 
 def run_full_check(
