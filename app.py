@@ -430,7 +430,7 @@ def check_and_analyze(
             col_11 = row[10].strip() if len(row) > 10 else ""
             col_25 = row[TARGET_COL_25].strip() if len(row) > TARGET_COL_25 else ""
             col_38 = row[TARGET_COL_38].strip() if len(row) > TARGET_COL_38 else ""
-            if col_25 == "Z00014" and col_38 not in {"3000", "5000"}:
+            if col_25 == "Z00014" and col_38 not in {"3000", "5000","-3000","-5000"}:
                 error_details.append(
                     ErrorDetail(
                         row=start_physical_line,
